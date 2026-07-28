@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: STATUS_ZERO_SUCCESS_FIXED_2026-07-28
+# VERSION: DUAL_CURRENT_AND_PAID_QUERY_2026-07-28
 """
 監理服務網「法人交通違規繳費紀錄查詢」批次輔助工具。
 
@@ -20,8 +20,9 @@
    由 englishAlphanumeric.py 內的人工 UI 顯示圖片、等待使用者輸入，
    再接收 imageInput() 回傳的四個英數字元。
 6. 自動把回傳字串填入網頁驗證碼欄位，按下查詢。
-7. 僅擷取真正的「未繳／需到案」及「繳納紀錄」表格，排除網站導覽表格。
-8. 明細工作表沿用來源 Excel 的「155598」格式：A:G、無額外標題與中繼資料。
+7. 每筆公司先查詢「交通違規（含強制險）查詢及繳納」，擷取可線上與不可線上繳納表格。
+8. 再查詢原本的「法人交通違規繳費紀錄」，並將兩階段結果合併。
+9. 明細工作表沿用來源 Excel 的「155598」格式：A:G、無額外標題與中繼資料。
 9. 更新主表的交通違規筆數、查詢狀態、查詢時間與錯誤訊息。
 10. 永遠寫入新的 Excel；支援逐筆儲存及中斷續跑。
 11. 若某筆 CAPTCHA 在同一輪內連續失敗，會先移至工作佇列尾端，
@@ -150,6 +151,46 @@ NO_PAID_DATA_XPATH = (
     "tbody/tr/td[1]"
 )
 
+# 第一階段：「交通違規（含強制險）查詢及繳納」。
+# 依使用者指定，先從目前的法人繳費紀錄入口頁進入；若該入口頁
+# 沒有載入新版查詢頁，則使用監理服務網正式的 penaltyQueryPay 路徑備援。
+DEFAULT_CURRENT_QUERY_URL = DEFAULT_URL
+CURRENT_QUERY_DIRECT_FALLBACK_URL = (
+    "https://www.mvdis.gov.tw/m3-emv-vil/vil/penaltyQueryPay"
+)
+
+# 「交通違規（含強制險）查詢及繳納」法人頁籤。
+CURRENT_QUERY_CORPORATE_TAB_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/div[3]/table/"
+    "tbody/tr/td[2]/span/img"
+)
+
+# 法人資料與 CAPTCHA 填完後的查詢按鈕。
+CURRENT_QUERY_BUTTON_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/div[3]/div/"
+    "div[2]/form/div/a"
+)
+
+# 第一階段查詢結果容器與目前頁籤所顯示的表格。
+CURRENT_RESULT_CONTAINER_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/form/div[2]/div[2]/div"
+)
+CURRENT_RESULT_TABLE_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/form/div[2]/div[2]/"
+    "div/div[2]/table"
+)
+
+# 結果頁第二個頁籤；點擊後 CURRENT_RESULT_TABLE_XPATH 會切換成
+# 另一組（不可線上繳納／需臨櫃處理）資料。
+CURRENT_RESULT_SECOND_TAB_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/form/div[2]/"
+    "table[2]/tbody/tr/td[2]/span/img"
+)
+
+COMBINED_QUERY_MESSAGE_MARKER = "雙階段查詢完成"
+CURRENT_ONLINE_CATEGORY = "可線上繳納"
+CURRENT_OFFLINE_CATEGORY = "不可線上繳納"
+
 DETAIL_TEMPLATE_SHEET_NAME = "__違規明細範本__"
 DEFAULT_DETAIL_TEMPLATE_SHEET = "155598"
 
@@ -195,6 +236,10 @@ NO_DATA_PATTERNS = (
     "查無已繳納罰鍰資料",
     "無已繳納罰鍰資料",
     "查無罰鍰繳納資料",
+    "查無可線上繳納罰單資料",
+    "查無不可線上繳納罰單資料",
+    "查無交通違規資料",
+    "無交通違規資料",
 )
 
 CAPTCHA_ERROR_PATTERNS = (
@@ -2519,6 +2564,7 @@ def page_has_query_form(page: Page) -> bool:
     selectors = (
         "form#form2",
         f"xpath={QUERY_BUTTON_XPATH}",
+        f"xpath={CURRENT_QUERY_BUTTON_XPATH}",
         "input[name*='captcha' i]",
         "input[id*='captcha' i]",
         "input[name*='verify' i]",
@@ -2544,6 +2590,9 @@ def page_has_result_marker(page: Page) -> bool:
         "div.cont90 div.caption_std",
         f"xpath={RESULT_JSON_XPATH}",
         f"xpath={NO_PAID_DATA_XPATH}",
+        f"xpath={CURRENT_RESULT_CONTAINER_XPATH}",
+        f"xpath={CURRENT_RESULT_TABLE_XPATH}",
+        f"xpath={CURRENT_RESULT_SECOND_TAB_XPATH}",
     )
 
     for selector in selectors:
@@ -4622,7 +4671,857 @@ def ensure_query_form_after_optional_login(
 
 
 
-def perform_query(
+def click_locator_with_fallback(
+    page: Page,
+    locator: Locator,
+    exact_xpath: str,
+    timeout_ms: int,
+    label: str,
+) -> str:
+    """使用一般、強制與 JavaScript 三層方式點擊指定控制項。"""
+    errors: list[str] = []
+
+    try:
+        locator.scroll_into_view_if_needed(
+            timeout=min(timeout_ms, 5000)
+        )
+    except PlaywrightError:
+        pass
+
+    try:
+        locator.click(
+            timeout=min(timeout_ms, 10000)
+        )
+        return f"{label}一般點擊"
+    except PlaywrightError as exc:
+        errors.append(f"一般點擊：{exc}")
+
+    try:
+        locator.click(
+            timeout=min(timeout_ms, 10000),
+            force=True,
+        )
+        return f"{label}強制點擊"
+    except PlaywrightError as exc:
+        errors.append(f"強制點擊：{exc}")
+
+    try:
+        locator.evaluate(
+            "element => element.click()"
+        )
+        return f"{label}JavaScript 點擊"
+    except Exception as exc:
+        errors.append(
+            "定位器 JavaScript 點擊："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    try:
+        clicked = page.evaluate(
+            """
+            xpath => {
+              const element = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+              ).singleNodeValue;
+
+              if (!element) {
+                return false;
+              }
+
+              element.click();
+              return true;
+            }
+            """,
+            exact_xpath,
+        )
+
+        if clicked:
+            return f"{label}document.evaluate() 點擊"
+    except PlaywrightError as exc:
+        errors.append(f"document.evaluate()：{exc}")
+
+    raise RuntimeError(
+        f"{label}已定位，但所有點擊方式均失敗；"
+        f"XPath：{exact_xpath}；"
+        f"錯誤：{' | '.join(errors)}"
+    )
+
+
+def locate_current_query_corporate_tab(
+    page: Page,
+) -> Locator | None:
+    """定位第一階段查詢頁的「法人」頁籤。"""
+    exact = page.locator(
+        f"xpath={CURRENT_QUERY_CORPORATE_TAB_XPATH}"
+    )
+
+    try:
+        if exact.count() > 0:
+            return exact.first
+    except PlaywrightError:
+        pass
+
+    candidates = (
+        page.get_by_role(
+            "img",
+            name=re.compile(r"法人", re.I),
+        ),
+        page.locator(
+            "img[alt*='法人']"
+        ),
+        page.locator(
+            "img[title*='法人']"
+        ),
+        page.locator(
+            "td:has-text('法人') span img"
+        ),
+    )
+
+    for candidate in candidates:
+        try:
+            if candidate.count() > 0:
+                return candidate.first
+        except PlaywrightError:
+            continue
+
+    return None
+
+
+def locate_current_query_button(
+    page: Page,
+) -> Locator:
+    """定位第一階段法人查詢表單的查詢按鈕。"""
+    exact = page.locator(
+        f"xpath={CURRENT_QUERY_BUTTON_XPATH}"
+    )
+
+    try:
+        exact.first.wait_for(
+            state="attached",
+            timeout=5000,
+        )
+        if exact.count() > 0:
+            return exact.first
+    except PlaywrightError:
+        pass
+
+    # 只在第一階段指定的 form 範圍內備援定位，避免誤抓到
+    # 原本「法人交通違規繳費紀錄查詢」頁面的查詢按鈕。
+    scoped = page.locator(
+        "xpath=/html/body/table/tbody/tr[2]/td[1]/div[3]/"
+        "div/div[2]/form//a[contains(normalize-space(.), '查詢')]"
+    )
+
+    try:
+        if scoped.count() > 0:
+            return scoped.first
+    except PlaywrightError:
+        pass
+
+    raise RuntimeError(
+        "找不到交通違規（含強制險）法人查詢按鈕；"
+        f"XPath：{CURRENT_QUERY_BUTTON_XPATH}"
+    )
+
+
+def open_current_query_corporate_form(
+    page: Page,
+    entry_url: str,
+    timeout_ms: int,
+) -> None:
+    """
+    開啟「交通違規（含強制險）查詢及繳納」法人表單。
+
+    第一個網址依使用者指定使用原本 legal 入口；若頁面沒有法人頁籤，
+    再改用監理服務網正式 penaltyQueryPay 路徑。
+    """
+    urls: list[str] = []
+
+    for candidate_url in (
+        entry_url,
+        CURRENT_QUERY_DIRECT_FALLBACK_URL,
+    ):
+        if candidate_url and candidate_url not in urls:
+            urls.append(candidate_url)
+
+    errors: list[str] = []
+
+    for candidate_url in urls:
+        try:
+            page.goto(
+                candidate_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+
+            try:
+                page.wait_for_load_state(
+                    "networkidle",
+                    timeout=min(timeout_ms, 12000),
+                )
+            except PlaywrightTimeoutError:
+                pass
+
+            # 若已經是法人表單，不必重複點頁籤。
+            try:
+                locate_current_query_button(page)
+                locate_company_id_input(page)
+                return
+            except RuntimeError:
+                pass
+
+            corporate_tab = (
+                locate_current_query_corporate_tab(
+                    page
+                )
+            )
+
+            if corporate_tab is None:
+                raise RuntimeError(
+                    "找不到交通違規（含強制險）查詢頁的法人頁籤"
+                )
+
+            method = click_locator_with_fallback(
+                page=page,
+                locator=corporate_tab,
+                exact_xpath=(
+                    CURRENT_QUERY_CORPORATE_TAB_XPATH
+                ),
+                timeout_ms=timeout_ms,
+                label="法人頁籤",
+            )
+
+            print(
+                f"  第一階段法人頁籤點擊方式：{method}",
+                flush=True,
+            )
+
+            locate_current_query_button(page)
+            locate_company_id_input(page)
+            return
+
+        except Exception as exc:
+            errors.append(
+                f"{candidate_url}："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    raise RuntimeError(
+        "無法開啟交通違規（含強制險）法人查詢表單；"
+        + " | ".join(errors)
+    )
+
+
+def click_current_query_button(
+    page: Page,
+    timeout_ms: int,
+) -> str:
+    button = locate_current_query_button(page)
+    return click_locator_with_fallback(
+        page=page,
+        locator=button,
+        exact_xpath=CURRENT_QUERY_BUTTON_XPATH,
+        timeout_ms=timeout_ms,
+        label="交通違規（含強制險）查詢按鈕",
+    )
+
+
+def table_rows_from_locator(
+    table_locator: Locator,
+) -> list[list[dict[str, Any]]]:
+    """只讀取目標 table 的直屬列與儲存格，避免抓到外層導覽表格。"""
+    return table_locator.evaluate(
+        """
+        table => {
+          const norm = value => (value || '')
+            .replace(/\\s+/g, ' ')
+            .trim();
+
+          const rows = [
+            ...table.querySelectorAll(
+              ':scope > thead > tr, '
+              + ':scope > tbody > tr, '
+              + ':scope > tfoot > tr, '
+              + ':scope > tr'
+            )
+          ];
+
+          return rows.map(row => [
+            ...row.children
+          ]
+            .filter(cell => (
+              cell.tagName === 'TH'
+              || cell.tagName === 'TD'
+            ))
+            .map(cell => ({
+              text: norm(cell.innerText),
+              header: cell.tagName === 'TH'
+            })))
+            .filter(row => row.length > 0);
+        }
+        """
+    )
+
+
+def add_current_category_to_row(
+    row: list[Any],
+    category: str,
+) -> list[Any]:
+    canonical = list(row[:7])
+    canonical += [None] * (7 - len(canonical))
+
+    existing_status = normalize_text(
+        canonical[0]
+    )
+
+    canonical[0] = (
+        f"{category}／{existing_status}"
+        if existing_status
+        else category
+    )
+
+    return canonical
+
+
+def extract_current_table_at_xpath(
+    page: Page,
+    category: str,
+) -> ExtractedTable | None:
+    """擷取目前結果頁籤的精確表格並轉成 155598 的 A:G 結構。"""
+    locator = page.locator(
+        f"xpath={CURRENT_RESULT_TABLE_XPATH}"
+    )
+
+    try:
+        if locator.count() <= 0:
+            return None
+
+        locator.first.wait_for(
+            state="visible",
+            timeout=5000,
+        )
+
+        payload = table_rows_from_locator(
+            locator.first
+        )
+    except PlaywrightError:
+        return None
+
+    plain_rows = [
+        [
+            normalize_text(
+                cell.get("text")
+            )
+            for cell in row
+        ]
+        for row in payload
+    ]
+
+    combined_text = " ".join(
+        " ".join(row)
+        for row in plain_rows
+    )
+
+    if contains_any(
+        combined_text,
+        NO_DATA_PATTERNS,
+    ):
+        return None
+
+    identified = identify_result_header(
+        plain_rows
+    )
+
+    canonical_rows: list[list[Any]] = []
+    headers: list[str] = []
+
+    if identified is not None:
+        kind, header_row, columns = identified
+        headers = plain_rows[header_row]
+
+        for row in plain_rows[header_row + 1:]:
+            canonical = (
+                canonicalize_unpaid_row(
+                    row,
+                    columns,
+                )
+                if kind == TABLE_KIND_UNPAID
+                else None
+            )
+
+            if canonical is None:
+                continue
+
+            canonical_rows.append(
+                add_current_category_to_row(
+                    canonical,
+                    category,
+                )
+            )
+    else:
+        # 網站若只更換表頭名稱，仍保留每一列的原始文字，避免整張表遺失。
+        data_start = 0
+        for index, raw_row in enumerate(payload):
+            if any(
+                bool(cell.get("header"))
+                for cell in raw_row
+            ):
+                headers = plain_rows[index]
+                data_start = index + 1
+                break
+
+        for row in plain_rows[data_start:]:
+            if not any(row):
+                continue
+
+            row_text = " ".join(row)
+            if contains_any(
+                row_text,
+                NO_DATA_PATTERNS,
+            ):
+                continue
+
+            raw_values: list[Any] = list(row[:7])
+            raw_values += [None] * (
+                7 - len(raw_values)
+            )
+
+            raw_values[0] = (
+                f"{category}／{normalize_text(raw_values[0])}"
+                if normalize_text(raw_values[0])
+                else category
+            )
+
+            canonical_rows.append(
+                raw_values
+            )
+
+    if not canonical_rows:
+        return None
+
+    return ExtractedTable(
+        kind=TABLE_KIND_UNPAID,
+        title=category,
+        headers=headers,
+        rows=canonical_rows,
+    )
+
+
+def current_result_table_text(
+    page: Page,
+) -> str:
+    locator = page.locator(
+        f"xpath={CURRENT_RESULT_TABLE_XPATH}"
+    )
+
+    try:
+        if locator.count() <= 0:
+            return ""
+        return normalize_text(
+            locator.first.inner_text(
+                timeout=3000
+            )
+        )
+    except PlaywrightError:
+        return ""
+
+
+def wait_for_current_table_change(
+    page: Page,
+    before_text: str,
+    timeout_ms: int,
+) -> bool:
+    deadline = time.monotonic() + min(
+        max(timeout_ms, 1000),
+        12000,
+    ) / 1000.0
+
+    while time.monotonic() < deadline:
+        now = current_result_table_text(page)
+        body = body_text(page)
+
+        if (
+            now != before_text
+            or "查無不可線上繳納" in body
+            or "無不可線上繳納" in body
+        ):
+            return True
+
+        time.sleep(0.25)
+
+    return False
+
+
+def collect_current_violation_tables(
+    page: Page,
+    timeout_ms: int,
+) -> list[ExtractedTable]:
+    """依序收集可線上繳納及第二頁籤的表格。"""
+    tables: list[ExtractedTable] = []
+
+    online_table = extract_current_table_at_xpath(
+        page,
+        CURRENT_ONLINE_CATEGORY,
+    )
+
+    if online_table is not None:
+        tables.append(online_table)
+
+    before_table_text = current_result_table_text(
+        page
+    )
+
+    second_tab = page.locator(
+        f"xpath={CURRENT_RESULT_SECOND_TAB_XPATH}"
+    )
+
+    try:
+        second_tab_exists = second_tab.count() > 0
+    except PlaywrightError:
+        second_tab_exists = False
+
+    if second_tab_exists:
+        method = click_locator_with_fallback(
+            page=page,
+            locator=second_tab.first,
+            exact_xpath=(
+                CURRENT_RESULT_SECOND_TAB_XPATH
+            ),
+            timeout_ms=timeout_ms,
+            label="不可線上繳納頁籤",
+        )
+
+        print(
+            f"  第一階段第二頁籤點擊方式：{method}",
+            flush=True,
+        )
+
+        changed = wait_for_current_table_change(
+            page,
+            before_table_text,
+            timeout_ms,
+        )
+
+        offline_table = extract_current_table_at_xpath(
+            page,
+            CURRENT_OFFLINE_CATEGORY,
+        )
+
+        # 若內容沒有切換，避免把第一頁籤資料重複寫入兩次。
+        if (
+            offline_table is not None
+            and (
+                changed
+                or current_result_table_text(page)
+                != before_table_text
+            )
+        ):
+            tables.append(offline_table)
+
+    return tables
+
+
+def perform_current_violation_query(
+    page: Page,
+    company: CompanyRow,
+    entry_url: str,
+    timeout_ms: int,
+    max_captcha_attempts: int,
+    debug_dir: Path,
+    captcha_dir: Path,
+    captcha_image_format: str,
+) -> QueryOutcome:
+    """第一階段：查詢尚未結案的交通違規及強制險違規。"""
+    last_retry_message = ""
+
+    for attempt in range(
+        1,
+        max_captcha_attempts + 1,
+    ):
+        try:
+            open_current_query_corporate_form(
+                page=page,
+                entry_url=entry_url,
+                timeout_ms=timeout_ms,
+            )
+
+            company_input = locate_company_id_input(
+                page
+            )
+            company_input.fill(
+                company.query_id
+            )
+
+            before = body_text(page)
+
+            try:
+                captcha_code = acquire_captcha(
+                    page=page,
+                    company=company,
+                    captcha_dir=captcha_dir,
+                    captcha_image_format=(
+                        captcha_image_format
+                    ),
+                )
+            except Exception as exc:
+                if not is_captcha_related_exception(exc):
+                    raise
+
+                last_retry_message = (
+                    "第一階段 CAPTCHA 辨識未取得四碼："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                print(
+                    "  第一階段 CAPTCHA 辨識失敗，將重新查詢"
+                    f"（{attempt}/{max_captcha_attempts}）。",
+                    flush=True,
+                )
+                continue
+
+            locate_captcha_input(page).fill(
+                captcha_code
+            )
+
+            submit_method = click_current_query_button(
+                page,
+                timeout_ms,
+            )
+
+            print(
+                f"  第一階段查詢按鈕點擊方式：{submit_method}",
+                flush=True,
+            )
+
+            text = wait_for_query_result_page(
+                page,
+                before,
+                timeout_ms,
+            )
+
+            if contains_any(
+                text,
+                CAPTCHA_ERROR_PATTERNS,
+            ):
+                last_retry_message = (
+                    "第一階段網站回報驗證碼輸入錯誤"
+                )
+                continue
+
+            if contains_any(
+                text,
+                FORM_ERROR_PATTERNS,
+            ):
+                message = next(
+                    pattern
+                    for pattern in FORM_ERROR_PATTERNS
+                    if pattern in text
+                )
+
+                if message in TRANSIENT_FORM_ERROR_PATTERNS:
+                    last_retry_message = (
+                        f"第一階段網站暫時性回應：{message}"
+                    )
+                    continue
+
+                return QueryOutcome(
+                    STATUS_ERROR,
+                    0,
+                    [],
+                    f"交通違規（含強制險）：{message}",
+                    page.url,
+                )
+
+            tables = collect_current_violation_tables(
+                page,
+                timeout_ms,
+            )
+
+            count = sum(
+                table.record_count
+                for table in tables
+            )
+
+            online_count = sum(
+                table.record_count
+                for table in tables
+                if table.title
+                == CURRENT_ONLINE_CATEGORY
+            )
+
+            offline_count = sum(
+                table.record_count
+                for table in tables
+                if table.title
+                == CURRENT_OFFLINE_CATEGORY
+            )
+
+            if count > 0:
+                return QueryOutcome(
+                    STATUS_SUCCESS,
+                    count,
+                    tables,
+                    (
+                        "交通違規（含強制險）查詢完成："
+                        f"可線上繳納 {online_count} 筆；"
+                        f"不可線上繳納 {offline_count} 筆"
+                    ),
+                    page.url,
+                )
+
+            text = body_text(page)
+
+            if contains_any(
+                text,
+                NO_DATA_PATTERNS,
+            ):
+                return QueryOutcome(
+                    STATUS_SUCCESS,
+                    0,
+                    [],
+                    "交通違規（含強制險）查詢完成：0 筆",
+                    page.url,
+                )
+
+            current_result_exists = False
+            for xpath in (
+                CURRENT_RESULT_CONTAINER_XPATH,
+                CURRENT_RESULT_TABLE_XPATH,
+                CURRENT_RESULT_SECOND_TAB_XPATH,
+            ):
+                try:
+                    if page.locator(
+                        f"xpath={xpath}"
+                    ).count() > 0:
+                        current_result_exists = True
+                        break
+                except PlaywrightError:
+                    continue
+
+            if current_result_exists:
+                save_debug_artifacts(
+                    page,
+                    debug_dir,
+                    company.query_id,
+                    "current_query_zero_result",
+                )
+                return QueryOutcome(
+                    STATUS_SUCCESS,
+                    0,
+                    [],
+                    (
+                        "交通違規（含強制險）查詢完成；"
+                        "結果頁無可辨識資料，依 0 筆處理"
+                    ),
+                    page.url,
+                )
+
+            last_retry_message = (
+                "第一階段結果頁尚未完整載入"
+            )
+
+        except Exception as exc:
+            if (
+                is_captcha_related_exception(exc)
+                or is_transient_page_exception(exc)
+            ):
+                last_retry_message = (
+                    "第一階段可重試錯誤："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            raise
+
+    return QueryOutcome(
+        STATUS_RETRY,
+        0,
+        [],
+        (
+            last_retry_message
+            or (
+                "交通違規（含強制險）查詢連續無法完成 "
+                f"{max_captcha_attempts} 次"
+            )
+        ),
+        page.url,
+        retry_later=True,
+    )
+
+
+def combine_query_outcomes(
+    current_outcome: QueryOutcome,
+    paid_outcome: QueryOutcome,
+) -> QueryOutcome:
+    """將第一階段未結案違規與第二階段繳費紀錄合併。"""
+    completed_statuses = {
+        STATUS_SUCCESS,
+        STATUS_NO_DATA,
+    }
+
+    if (
+        current_outcome.status == STATUS_ERROR
+        or paid_outcome.status == STATUS_ERROR
+    ):
+        return QueryOutcome(
+            STATUS_ERROR,
+            0,
+            [],
+            (
+                "雙階段查詢失敗；"
+                f"第一階段：{current_outcome.message}；"
+                f"第二階段：{paid_outcome.message}"
+            ),
+            current_outcome.result_url
+            or paid_outcome.result_url,
+        )
+
+    if (
+        current_outcome.status not in completed_statuses
+        or paid_outcome.status not in completed_statuses
+    ):
+        return QueryOutcome(
+            STATUS_RETRY,
+            0,
+            [],
+            (
+                "雙階段查詢尚未全部完成；"
+                f"第一階段：{current_outcome.message}；"
+                f"第二階段：{paid_outcome.message}"
+            ),
+            current_outcome.result_url
+            or paid_outcome.result_url,
+            retry_later=True,
+        )
+
+    tables = (
+        list(current_outcome.tables)
+        + list(paid_outcome.tables)
+    )
+
+    total_count = (
+        current_outcome.record_count
+        + paid_outcome.record_count
+    )
+
+    return QueryOutcome(
+        STATUS_SUCCESS,
+        total_count,
+        tables,
+        (
+            f"{COMBINED_QUERY_MESSAGE_MARKER}；"
+            f"第一階段 {current_outcome.record_count} 筆；"
+            f"第二階段 {paid_outcome.record_count} 筆；"
+            f"合計 {total_count} 筆"
+        ),
+        current_outcome.result_url
+        or paid_outcome.result_url,
+    )
+
+
+def perform_paid_record_query(
     page: Page,
     company: CompanyRow,
     query_url: str,
@@ -4987,6 +5886,23 @@ def should_skip_row(
     if status != STATUS_SUCCESS:
         return False
 
+    query_message = normalize_text(
+        worksheet.cell(
+            company.excel_row,
+            tracking_columns[
+                "違規查詢訊息"
+            ],
+        ).value
+    )
+
+    # 舊版只做繳費紀錄查詢；沒有雙階段標記時必須重新處理，
+    # 才能補上可線上與不可線上繳納的目前違規資料。
+    if (
+        COMBINED_QUERY_MESSAGE_MARKER
+        not in query_message
+    ):
+        return False
+
     record_count_value = worksheet.cell(
         company.excel_row,
         tracking_columns[
@@ -5178,7 +6094,8 @@ def launch_browser(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "依 Excel 統一編號查詢監理服務網法人違規明細；"
+            "依 Excel 統一編號先查交通違規（含強制險），"
+            "再查法人交通違規繳費紀錄；"
             "結果優先從 hidden JSON 讀取，"
             "明細工作表沿用來源 155598 格式。"
         )
@@ -5212,6 +6129,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "來源 Excel 中作為明細格式範本的工作表；"
             "預設 155598"
+        ),
+    )
+
+    parser.add_argument(
+        "--current-query-url",
+        default=DEFAULT_CURRENT_QUERY_URL,
+        help=(
+            "第一階段交通違規（含強制險）入口網址；"
+            "預設先使用原本 legal 入口，找不到時自動改用 penaltyQueryPay"
         ),
     )
 
@@ -5555,6 +6481,26 @@ def main(
     )
 
     print(
+        "第一階段法人頁籤 XPath："
+        f"{CURRENT_QUERY_CORPORATE_TAB_XPATH}"
+    )
+
+    print(
+        "第一階段查詢按鈕 XPath："
+        f"{CURRENT_QUERY_BUTTON_XPATH}"
+    )
+
+    print(
+        "第一階段結果表格 XPath："
+        f"{CURRENT_RESULT_TABLE_XPATH}"
+    )
+
+    print(
+        "第一階段第二頁籤 XPath："
+        f"{CURRENT_RESULT_SECOND_TAB_XPATH}"
+    )
+
+    print(
         "查詢按鈕 XPath："
         f"{QUERY_BUTTON_XPATH}"
     )
@@ -5669,20 +6615,56 @@ def main(
                 queried_at = datetime.now()
 
                 try:
-                    outcome = perform_query(
-                        page=page,
-                        company=company,
-                        query_url=args.url,
-                        timeout_ms=args.timeout,
-                        max_captcha_attempts=(
-                            args.max_captcha_attempts
-                        ),
-                        debug_dir=debug_dir,
-                        captcha_dir=captcha_dir,
-                        captcha_image_format=(
-                            args.captcha_image_format
-                        ),
-                        headless=args.headless,
+                    print(
+                        "  [階段 1/2] 交通違規（含強制險）查詢及繳納",
+                        flush=True,
+                    )
+
+                    current_outcome = (
+                        perform_current_violation_query(
+                            page=page,
+                            company=company,
+                            entry_url=(
+                                args.current_query_url
+                            ),
+                            timeout_ms=args.timeout,
+                            max_captcha_attempts=(
+                                args.max_captcha_attempts
+                            ),
+                            debug_dir=debug_dir,
+                            captcha_dir=captcha_dir,
+                            captcha_image_format=(
+                                args.captcha_image_format
+                            ),
+                        )
+                    )
+
+                    print(
+                        "  [階段 2/2] 法人交通違規繳費紀錄查詢",
+                        flush=True,
+                    )
+
+                    paid_outcome = (
+                        perform_paid_record_query(
+                            page=page,
+                            company=company,
+                            query_url=args.url,
+                            timeout_ms=args.timeout,
+                            max_captcha_attempts=(
+                                args.max_captcha_attempts
+                            ),
+                            debug_dir=debug_dir,
+                            captcha_dir=captcha_dir,
+                            captcha_image_format=(
+                                args.captcha_image_format
+                            ),
+                            headless=args.headless,
+                        )
+                    )
+
+                    outcome = combine_query_outcomes(
+                        current_outcome,
+                        paid_outcome,
                     )
 
                 except KeyboardInterrupt:
