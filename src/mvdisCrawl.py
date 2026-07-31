@@ -1,42 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: DUAL_CURRENT_AND_PAID_QUERY_2026-07-28
+# VERSION: PAGINATION_SCOPED_LINK_SERVER_CONFIRMED_2026-08-01
 """
-監理服務網「法人交通違規繳費紀錄查詢」批次輔助工具。
+監理服務網法人交通違規雙階段批次查詢工具。
 
-功能：
-1. 從既有 Excel 找出「統一編號／登記編號」與登記名稱。
-2. 使用 Playwright 開啟監理服務網，自動填入統一編號。
-3. 依指定 XPath／語意備援定位 CAPTCHA 所在的 td 區塊，保存成 PNG 或 JPG。
-4. 將驗證碼圖片開啟成 PIL.Image.Image。
-5. 使用指定的匯入方式：
+主要流程：
+1. 從 Excel 讀取統一編號／登記編號與登記名稱。
+2. 使用 Playwright 先查詢「交通違規（含強制險）查詢及繳納」。
+3. 分別完整擷取「可線上繳納」與「不可線上繳納」的每一頁。
+4. 再查詢「交通違規繳納記錄查詢」，逐頁擷取所有已繳納紀錄。
+5. CAPTCHA 圖片以 PIL.Image.Image 傳給：
 
-       from englishAlphanumeric import imageInput
+       from englishAlphanumericOcrApi import ocrImage
+       code = ocrImage(image)
 
-   並直接呼叫：
-
-       imageInput(image)
-
-   由 englishAlphanumeric.py 內的人工 UI 顯示圖片、等待使用者輸入，
-   再接收 imageInput() 回傳的四個英數字元。
-6. 自動把回傳字串填入網頁驗證碼欄位，按下查詢。
-7. 每筆公司先查詢「交通違規（含強制險）查詢及繳納」，擷取可線上與不可線上繳納表格。
-8. 再查詢原本的「法人交通違規繳費紀錄」，並將兩階段結果合併。
-9. 明細工作表沿用來源 Excel 的「155598」格式：A:G、無額外標題與中繼資料。
-9. 更新主表的交通違規筆數、查詢狀態、查詢時間與錯誤訊息。
-10. 永遠寫入新的 Excel；支援逐筆儲存及中斷續跑。
-11. 若某筆 CAPTCHA 在同一輪內連續失敗，會先移至工作佇列尾端，
-    讓其他資料先完成，再自動回頭重做，並限制重排次數避免無限循環。
-
-englishAlphanumeric.py 必須與本腳本放在同一資料夾，並提供：
-
-    def imageInput(
-        image: Image.Image,
-    ) -> str:
-        ...
-
-imageInput() 必須在人工 UI 完成輸入後回傳恰好四個英數字元。
-本程式不包含 OCR、自動辨識、破解或繞過驗證碼。
+6. 依網站 showbanner 驗證：
+   - 實際走訪頁碼等於網站宣告總頁數。
+   - 擷取筆數等於網站宣告總筆數。
+   - 唯一資料筆數等於網站宣告總筆數。
+   - 不得有同頁或跨頁重複擷取。
+7. 完整性不符時立即重爬同一家公司，不會直接處理下一家公司；
+   達重試上限後預設停止整批，避免把不完整結果標記為成功。
+8. Excel 主表新增三組分頁資訊、完整性檢查與重複資料檢查欄位。
+9. 公司明細工作表 A:G 保留原 155598 格式，H:N 註明每筆資料來源頁碼、
+   總頁數、網站宣告總筆數、分頁文字與資料唯一鍵。
+10. 新增「分頁完整性稽核」及「重複資料稽核」工作表。
+11. 所有未解決錯誤與分頁驗證失敗均寫入 results\\mvdis_errorLog 的 JSON。
+12. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；舊版未經分頁驗證的
+    「成功」資料會自動重新查詢。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -44,7 +35,7 @@ imageInput() 必須在人工 UI 完成輸入後回傳恰好四個英數字元。
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, defaultdict, deque
 from copy import copy
 import hashlib
 from html import unescape
@@ -55,10 +46,18 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+import traceback
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 try:
     from openpyxl import load_workbook
@@ -115,6 +114,7 @@ DEFAULT_INPUT_PATH = PROJECT_ROOT / "Data" / "高雄市.xlsx"
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
 DEFAULT_CAPTCHA_DIR = DEFAULT_RESULTS_DIR / "mvdis_captcha"
 DEFAULT_DEBUG_DIR = DEFAULT_RESULTS_DIR / "mvdis_debug"
+DEFAULT_ERROR_LOG_DIR = DEFAULT_RESULTS_DIR / "mvdis_errorLog"
 
 DEFAULT_URL = (
     "https://www.mvdis.gov.tw/m3-emv-vil/vil/penaltyQueryPayRecord/legal"
@@ -186,6 +186,29 @@ CURRENT_RESULT_SECOND_TAB_XPATH = (
     "/html/body/table/tbody/tr[2]/td[1]/form/div[2]/"
     "table[2]/tbody/tr/td[2]/span/img"
 )
+
+# 第二階段「交通違規繳納記錄查詢」分頁資訊。
+# 範例：1 / 27 頁，共 262 筆資料。
+PAID_PAGINATION_BANNER_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/div[3]/form/div[1]/span"
+)
+
+# 第一階段「交通違規（含強制險）查詢及繳納」分頁資訊。
+# 可線上繳納與不可線上繳納頁籤共用此位置。
+CURRENT_PAGINATION_BANNER_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/form/div[2]/div[2]/"
+    "div/div[2]/div/span"
+)
+
+QUERY_SECTION_CURRENT = "交通違規（含強制險）查詢及繳納"
+QUERY_SECTION_PAID = "交通違規繳納記錄查詢"
+PAID_RECORD_CATEGORY = "已繳納紀錄"
+
+PAGINATION_VERIFIED_MARKER = "分頁完整性已驗證"
+PAGINATION_AUDIT_SHEET_NAME = "分頁完整性稽核"
+DUPLICATE_AUDIT_SHEET_NAME = "重複資料稽核"
+DETAIL_AUDIT_FIRST_COLUMN = 8
+DETAIL_AUDIT_LAST_COLUMN = 14
 
 COMBINED_QUERY_MESSAGE_MARKER = "雙階段查詢完成"
 CURRENT_ONLINE_CATEGORY = "可線上繳納"
@@ -285,16 +308,68 @@ class CompanyRow:
     name: str
 
 
+@dataclass(frozen=True)
+class PaginationInfo:
+    section: str
+    category: str
+    current_page: int
+    total_pages: int
+    declared_total_records: int
+    banner_text: str
+    raw_text: str
+
+
+@dataclass
+class PageAudit:
+    section: str
+    category: str
+    page_number: int
+    total_pages: int
+    declared_total_records: int
+    banner_text: str
+    extracted_count: int
+    record_keys: list[str]
+    result_url: str
+
+    @property
+    def unique_count(self) -> int:
+        return len(set(self.record_keys))
+
+    @property
+    def duplicate_count(self) -> int:
+        return max(0, len(self.record_keys) - self.unique_count)
+
+
 @dataclass
 class ExtractedTable:
     kind: str
     title: str
     headers: list[str]
     rows: list[list[Any]]
+    row_keys: list[str] = field(default_factory=list)
+    section: str = ""
+    category: str = ""
+    page_number: int = 1
+    total_pages: int = 1
+    declared_total_records: int | None = None
+    banner_text: str = ""
 
     @property
     def record_count(self) -> int:
         return len(self.rows)
+
+
+@dataclass(frozen=True)
+class DetailRecord:
+    kind: str
+    row: list[Any]
+    section: str
+    category: str
+    page_number: int
+    total_pages: int
+    declared_total_records: int
+    banner_text: str
+    record_key: str
 
 
 @dataclass
@@ -305,6 +380,8 @@ class QueryOutcome:
     message: str
     result_url: str
     retry_later: bool = False
+    page_audits: list[PageAudit] = field(default_factory=list)
+    duplicate_keys: list[str] = field(default_factory=list)
 
 
 class CaptchaRecognitionError(RuntimeError):
@@ -313,6 +390,18 @@ class CaptchaRecognitionError(RuntimeError):
 
 class TransientPageError(RuntimeError):
     """頁面仍在導向或結果尚未完整載入；應重新查詢。"""
+
+
+class DataIntegrityError(RuntimeError):
+    """分頁、筆數或重複資料驗證失敗；不得直接處理下一家公司。"""
+
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 def normalize_text(value: Any) -> str:
@@ -466,11 +555,17 @@ def ensure_tracking_columns(
     worksheet: Any,
     header_start_row: int,
 ) -> dict[str, int]:
+    """建立主表追蹤欄位，包含三組分頁資訊與完整性稽核結果。"""
     desired = [
         "交通違規筆數",
         "違規查詢狀態",
         "最後查詢時間",
         "違規查詢訊息",
+        "可線上繳納分頁資訊",
+        "不可線上繳納分頁資訊",
+        "繳納紀錄分頁資訊",
+        "分頁完整性檢查",
+        "重複資料檢查",
     ]
 
     existing: dict[str, int] = {}
@@ -535,10 +630,16 @@ def ensure_tracking_columns(
         "交通違規筆數": 14,
         "違規查詢狀態": 14,
         "最後查詢時間": 20,
-        "違規查詢訊息": 42,
+        "違規查詢訊息": 58,
+        "可線上繳納分頁資訊": 40,
+        "不可線上繳納分頁資訊": 40,
+        "繳納紀錄分頁資訊": 40,
+        "分頁完整性檢查": 26,
+        "重複資料檢查": 24,
     }
 
-    for header, col in existing.items():
+    for header in desired:
+        col = existing[header]
         cell = worksheet.cell(header_start_row, col)
         cell.value = header
         cell.fill = TITLE_FILL
@@ -560,7 +661,6 @@ def ensure_tracking_columns(
         ].width = widths[header]
 
     return existing
-
 
 def reset_tracking_values(
     worksheet: Any,
@@ -1413,40 +1513,81 @@ def clear_copied_detail_sheet(
         pass
 
 
-def collect_outcome_rows(
+def collect_outcome_records(
     outcome: QueryOutcome,
     kind: str,
-) -> list[list[Any]]:
-    rows: list[list[Any]] = []
+) -> list[DetailRecord]:
+    """
+    依實際擷取順序保留每一頁的每一筆資料。
 
-    seen_tables: set[str] = set()
+    不再自動刪除相同表格或相同資料；任何重複都必須先在
+    validate_page_audits() 被發現並阻止寫入 Excel。
+    """
+    records: list[DetailRecord] = []
 
     for table in outcome.tables:
         if table.kind != kind:
             continue
 
-        signature = hashlib.sha256(
-            json.dumps(
-                table.rows,
-                ensure_ascii=False,
-                sort_keys=False,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        ensure_table_row_keys(table)
 
-        if signature in seen_tables:
-            continue
+        for index, row in enumerate(table.rows):
+            record_key = (
+                table.row_keys[index]
+                if index < len(table.row_keys)
+                else record_fingerprint(row)
+            )
+            records.append(
+                DetailRecord(
+                    kind=table.kind,
+                    row=list(row),
+                    section=(
+                        table.section
+                        or (
+                            QUERY_SECTION_PAID
+                            if table.kind == TABLE_KIND_PAID
+                            else QUERY_SECTION_CURRENT
+                        )
+                    ),
+                    category=(
+                        table.category
+                        or table.title
+                    ),
+                    page_number=table.page_number,
+                    total_pages=table.total_pages,
+                    declared_total_records=int(
+                        table.declared_total_records
+                        if table.declared_total_records
+                        is not None
+                        else table.record_count
+                    ),
+                    banner_text=(
+                        table.banner_text
+                        or (
+                            f"{table.page_number} / "
+                            f"{table.total_pages} 頁，共 "
+                            f"{table.declared_total_records or table.record_count} 筆資料"
+                        )
+                    ),
+                    record_key=record_key,
+                )
+            )
 
-        seen_tables.add(
-            signature
+    return records
+
+
+def collect_outcome_rows(
+    outcome: QueryOutcome,
+    kind: str,
+) -> list[list[Any]]:
+    """保留舊呼叫介面；新程式應使用 collect_outcome_records()。"""
+    return [
+        record.row
+        for record in collect_outcome_records(
+            outcome,
+            kind,
         )
-
-        rows.extend(
-            [list(row) for row in table.rows]
-        )
-
-    return rows
-
+    ]
 
 def write_detail_sheet(
     workbook: Any,
@@ -1456,15 +1597,11 @@ def write_detail_sheet(
     queried_at: datetime,
 ) -> None:
     """
-    建立與來源 Excel「155598」相同的明細版面。
+    建立公司違規明細工作表。
 
-    輸出規則：
-    - 工作表名稱使用 155598，而不是 00155598。
-    - 不寫入「統一編號／登記名稱／查詢時間」等中繼資料。
-    - 不寫入自製標題列。
-    - 未繳／需到案資料放在最前面 A:F。
-    - 繳納紀錄接在後面 A:G。
-    - 直接沿用隱藏範本的字型、顏色、框線與頁面設定。
+    A:G 保留原本 155598 格式；H:N 直接寫入每一筆資料的來源階段、
+    類別、擷取頁碼、總頁數、網站宣告總筆數、showbanner 文字與
+    唯一鍵，讓使用者可逐筆追查該資料來自哪一頁。
     """
     del queried_at
 
@@ -1474,121 +1611,62 @@ def write_detail_sheet(
         company.query_id,
     )
 
-    template = workbook[
-        template_sheet_name
-    ]
-
+    template = workbook[template_sheet_name]
     worksheet = workbook.copy_worksheet(
         template
     )
-
     worksheet.title = detail_sheet_name(
         company.raw_id,
         company.query_id,
     )
-
     worksheet.sheet_state = "visible"
+    clear_copied_detail_sheet(worksheet)
 
-    clear_copied_detail_sheet(
-        worksheet
-    )
-
-    unpaid_rows = collect_outcome_rows(
+    unpaid_records = collect_outcome_records(
         outcome,
         TABLE_KIND_UNPAID,
     )
-
-    paid_rows = collect_outcome_rows(
+    paid_records = collect_outcome_records(
         outcome,
         TABLE_KIND_PAID,
     )
+    all_records = unpaid_records + paid_records
 
-    total_rows = (
-        len(unpaid_rows)
-        + len(paid_rows)
-    )
+    if not all_records:
+        workbook.remove(worksheet)
+        return
 
     current_row = 1
     normal_unpaid_index = 0
-    needs_appearance_index = 0
 
-    for row in unpaid_rows:
-        status = normalize_text(
-            row[0]
-        )
-
-        is_needs_appearance = (
-            "需到案" in status
-        )
-
-        if is_needs_appearance:
-            template_row = 5
-            needs_appearance_index += 1
-        else:
-            template_row = (
-                1
-                if normal_unpaid_index == 0
-                else 2
-            )
-            normal_unpaid_index += 1
-
-        copy_template_row_style(
-            template,
-            template_row,
-            worksheet,
-            current_row,
-        )
-
-        canonical = list(row[:7])
-        canonical += [None] * (
-            7 - len(canonical)
-        )
-
-        canonical[6] = None
-
-        for column, value in enumerate(
-            canonical,
-            start=1,
-        ):
-            worksheet.cell(
-                current_row,
-                column,
-                value,
-            )
-
-        view_cell = worksheet.cell(
-            current_row,
-            6,
-        )
-
-        if not normalize_text(
-            view_cell.value
-        ):
-            view_cell.value = "檢視"
-
-        if outcome.result_url:
-            view_cell.hyperlink = (
-                outcome.result_url
-            )
-
-        worksheet.row_dimensions[
-            current_row
-        ].height = estimate_legacy_row_height(
-            canonical,
-            TABLE_KIND_UNPAID,
-        )
-
-        current_row += 1
-
-    for paid_index, row in enumerate(
-        paid_rows,
+    for record_index, record in enumerate(
+        all_records
     ):
-        if paid_index == 0:
-            template_row = 6
-        elif paid_index == len(paid_rows) - 1:
-            template_row = 11
+        row = record.row
+
+        if record.kind == TABLE_KIND_UNPAID:
+            status = normalize_text(row[0])
+            is_needs_appearance = "需到案" in status
+
+            if is_needs_appearance:
+                template_row = 5
+            else:
+                template_row = (
+                    1
+                    if normal_unpaid_index == 0
+                    else 2
+                )
+                normal_unpaid_index += 1
         else:
-            template_row = 7
+            paid_index = record_index - len(
+                unpaid_records
+            )
+            if paid_index == 0:
+                template_row = 6
+            elif paid_index == len(paid_records) - 1:
+                template_row = 11
+            else:
+                template_row = 7
 
         copy_template_row_style(
             template,
@@ -1602,6 +1680,9 @@ def write_detail_sheet(
             7 - len(canonical)
         )
 
+        if record.kind == TABLE_KIND_UNPAID:
+            canonical[6] = None
+
         for column, value in enumerate(
             canonical,
             start=1,
@@ -1612,20 +1693,67 @@ def write_detail_sheet(
                 value,
             )
 
+        if record.kind == TABLE_KIND_UNPAID:
+            view_cell = worksheet.cell(
+                current_row,
+                6,
+            )
+            if not normalize_text(view_cell.value):
+                view_cell.value = "檢視"
+            if outcome.result_url:
+                view_cell.hyperlink = outcome.result_url
+
+        metadata_values = [
+            f"查詢階段：{record.section}",
+            f"資料分類：{record.category}",
+            f"擷取頁碼：{record.page_number}",
+            f"總頁數：{record.total_pages}",
+            (
+                "網站宣告總筆數："
+                f"{record.declared_total_records}"
+            ),
+            f"分頁資訊：{record.banner_text}",
+            f"資料唯一鍵：{record.record_key}",
+        ]
+
+        source_fill = copy(
+            worksheet.cell(current_row, 7).fill
+        )
+
+        for offset, value in enumerate(
+            metadata_values,
+            start=DETAIL_AUDIT_FIRST_COLUMN,
+        ):
+            cell = worksheet.cell(
+                current_row,
+                offset,
+                value,
+            )
+            cell.font = Font(
+                name="Arial",
+                size=7,
+                color=LEGACY_PAID_FONT_COLOR,
+            )
+            cell.fill = copy(source_fill)
+            cell.border = legacy_border(
+                left=False,
+                top=(current_row == 1),
+            )
+            cell.alignment = Alignment(
+                vertical="center",
+                wrap_text=True,
+            )
+
+        base_height = estimate_legacy_row_height(
+            canonical,
+            record.kind,
+        )
         worksheet.row_dimensions[
             current_row
-        ].height = estimate_legacy_row_height(
-            canonical,
-            TABLE_KIND_PAID,
-        )
-
+        ].height = max(base_height, 24.5)
         current_row += 1
 
-    if total_rows <= 0:
-        workbook.remove(
-            worksheet
-        )
-        return
+    total_rows = len(all_records)
 
     if worksheet.max_row > total_rows:
         worksheet.delete_rows(
@@ -1633,59 +1761,85 @@ def write_detail_sheet(
             worksheet.max_row - total_rows,
         )
 
+    audit_widths = {
+        "H": 34,
+        "I": 24,
+        "J": 15,
+        "K": 15,
+        "L": 22,
+        "M": 34,
+        "N": 68,
+    }
+
+    for column_letter, width in audit_widths.items():
+        worksheet.column_dimensions[
+            column_letter
+        ].width = width
+
     worksheet.sheet_view.showGridLines = True
+
 def ensure_log_sheet(workbook: Any) -> Any:
     title = "違規查詢紀錄"
+    headers = [
+        "查詢時間",
+        "Excel列",
+        "統一編號",
+        "登記名稱",
+        "狀態",
+        "違規筆數",
+        "訊息",
+        "結果網址",
+        "分頁驗證摘要",
+        "重複資料檢查",
+    ]
 
     if title in workbook.sheetnames:
         worksheet = workbook[title]
     else:
         worksheet = workbook.create_sheet(title)
 
-        headers = [
-            "查詢時間",
-            "Excel列",
-            "統一編號",
-            "登記名稱",
-            "狀態",
-            "違規筆數",
-            "訊息",
-            "結果網址",
-        ]
+    for column, header in enumerate(
+        headers,
+        start=1,
+    ):
+        cell = worksheet.cell(1, column, header)
+        cell.fill = TITLE_FILL
+        cell.font = WHITE_FONT
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = Border(
+            left=THIN_GRAY,
+            right=THIN_GRAY,
+            top=THIN_GRAY,
+            bottom=THIN_GRAY,
+        )
 
-        worksheet.append(headers)
+    worksheet.freeze_panes = "A2"
+    widths = [
+        20,
+        10,
+        14,
+        32,
+        12,
+        12,
+        58,
+        55,
+        80,
+        24,
+    ]
 
-        for cell in worksheet[1]:
-            cell.fill = TITLE_FILL
-            cell.font = WHITE_FONT
-            cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center",
-            )
-
-        worksheet.freeze_panes = "A2"
-
-        widths = [
-            20,
-            10,
-            14,
-            32,
-            12,
-            12,
-            50,
-            55,
-        ]
-
-        for index, width in enumerate(
-            widths,
-            start=1,
-        ):
-            worksheet.column_dimensions[
-                get_column_letter(index)
-            ].width = width
+    for index, width in enumerate(
+        widths,
+        start=1,
+    ):
+        worksheet.column_dimensions[
+            get_column_letter(index)
+        ].width = width
 
     return worksheet
-
 
 def append_log(
     worksheet: Any,
@@ -1705,6 +1859,10 @@ def append_log(
             outcome.record_count,
             outcome.message,
             outcome.result_url,
+            build_pagination_summary(
+                outcome.page_audits
+            ),
+            outcome_duplicate_text(outcome),
         ]
     )
 
@@ -1718,13 +1876,280 @@ def append_log(
             vertical="top",
             wrap_text=True,
         )
-
         cell.border = Border(
             left=THIN_GRAY,
             right=THIN_GRAY,
             top=THIN_GRAY,
             bottom=THIN_GRAY,
         )
+
+def style_audit_header(
+    worksheet: Any,
+    headers: Sequence[str],
+    widths: Sequence[float],
+) -> None:
+    for column, header in enumerate(
+        headers,
+        start=1,
+    ):
+        cell = worksheet.cell(1, column, header)
+        cell.fill = TITLE_FILL
+        cell.font = WHITE_FONT
+        cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center",
+            wrap_text=True,
+        )
+        cell.border = Border(
+            left=THIN_GRAY,
+            right=THIN_GRAY,
+            top=THIN_GRAY,
+            bottom=THIN_GRAY,
+        )
+        worksheet.column_dimensions[
+            get_column_letter(column)
+        ].width = widths[column - 1]
+
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = (
+        f"A1:{get_column_letter(len(headers))}1"
+    )
+
+
+def ensure_pagination_audit_sheet(
+    workbook: Any,
+) -> Any:
+    headers = [
+        "查詢時間",
+        "Excel列",
+        "統一編號",
+        "登記名稱",
+        "查詢階段",
+        "資料分類",
+        "擷取頁碼",
+        "總頁數",
+        "網站宣告總筆數",
+        "本頁擷取筆數",
+        "本頁唯一筆數",
+        "同頁重複筆數",
+        "全組擷取筆數",
+        "全組唯一筆數",
+        "全組重複筆數",
+        "分頁資訊",
+        "完整性結果",
+        "結果網址",
+    ]
+    widths = [
+        20, 10, 14, 30, 34, 20, 12, 12, 20,
+        16, 16, 16, 16, 16, 16, 34, 24, 55,
+    ]
+
+    if PAGINATION_AUDIT_SHEET_NAME in workbook.sheetnames:
+        worksheet = workbook[
+            PAGINATION_AUDIT_SHEET_NAME
+        ]
+    else:
+        worksheet = workbook.create_sheet(
+            PAGINATION_AUDIT_SHEET_NAME
+        )
+
+    style_audit_header(
+        worksheet,
+        headers,
+        widths,
+    )
+    return worksheet
+
+
+def ensure_duplicate_audit_sheet(
+    workbook: Any,
+) -> Any:
+    headers = [
+        "查詢時間",
+        "Excel列",
+        "統一編號",
+        "登記名稱",
+        "查詢階段",
+        "資料分類",
+        "資料唯一鍵",
+        "出現次數",
+        "出現頁碼",
+        "檢查結果",
+    ]
+    widths = [
+        20, 10, 14, 30, 34, 20, 68, 14, 24, 24,
+    ]
+
+    if DUPLICATE_AUDIT_SHEET_NAME in workbook.sheetnames:
+        worksheet = workbook[
+            DUPLICATE_AUDIT_SHEET_NAME
+        ]
+    else:
+        worksheet = workbook.create_sheet(
+            DUPLICATE_AUDIT_SHEET_NAME
+        )
+
+    style_audit_header(
+        worksheet,
+        headers,
+        widths,
+    )
+    return worksheet
+
+
+def remove_company_rows_from_sheet(
+    worksheet: Any,
+    company_id_column: int,
+    company_id: str,
+) -> None:
+    for row in range(
+        worksheet.max_row,
+        1,
+        -1,
+    ):
+        value = normalize_text(
+            worksheet.cell(
+                row,
+                company_id_column,
+            ).value
+        )
+
+        if value == company_id:
+            worksheet.delete_rows(row, 1)
+
+
+def replace_company_audit_rows(
+    pagination_sheet: Any,
+    duplicate_sheet: Any,
+    company: CompanyRow,
+    outcome: QueryOutcome,
+    queried_at: datetime,
+) -> None:
+    """以本次查詢結果覆蓋該公司的舊分頁稽核紀錄。"""
+    remove_company_rows_from_sheet(
+        pagination_sheet,
+        3,
+        company.query_id,
+    )
+    remove_company_rows_from_sheet(
+        duplicate_sheet,
+        3,
+        company.query_id,
+    )
+
+    grouped = group_page_audits(
+        outcome.page_audits
+    )
+
+    for group, items in grouped.items():
+        stats = page_audit_group_stats(items)
+        expected_pages = set(
+            range(1, int(stats["total_pages"]) + 1)
+        )
+        passed = (
+            set(stats["visited_pages"])
+            == expected_pages
+            and int(stats["extracted_count"])
+            == int(stats["declared_total_records"])
+            and int(stats["unique_count"])
+            == int(stats["declared_total_records"])
+            and int(stats["duplicate_count"]) == 0
+        )
+
+        for audit in items:
+            pagination_sheet.append(
+                [
+                    queried_at.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    company.excel_row,
+                    company.query_id,
+                    company.name,
+                    audit.section,
+                    audit.category,
+                    audit.page_number,
+                    audit.total_pages,
+                    audit.declared_total_records,
+                    audit.extracted_count,
+                    audit.unique_count,
+                    audit.duplicate_count,
+                    stats["extracted_count"],
+                    stats["unique_count"],
+                    stats["duplicate_count"],
+                    audit.banner_text,
+                    "通過" if passed else "未通過",
+                    audit.result_url,
+                ]
+            )
+
+            for cell in pagination_sheet[
+                pagination_sheet.max_row
+            ]:
+                cell.alignment = Alignment(
+                    vertical="top",
+                    wrap_text=True,
+                )
+                cell.border = Border(
+                    left=THIN_GRAY,
+                    right=THIN_GRAY,
+                    top=THIN_GRAY,
+                    bottom=THIN_GRAY,
+                )
+
+        page_map: dict[str, list[int]] = defaultdict(list)
+        counts: Counter[str] = Counter()
+
+        for audit in items:
+            for key in audit.record_keys:
+                counts[key] += 1
+                page_map[key].append(
+                    audit.page_number
+                )
+
+        for key, count in counts.items():
+            if count <= 1:
+                continue
+
+            duplicate_sheet.append(
+                [
+                    queried_at.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    company.excel_row,
+                    company.query_id,
+                    company.name,
+                    group[0],
+                    group[1],
+                    key,
+                    count,
+                    ", ".join(
+                        str(page_number)
+                        for page_number in page_map[key]
+                    ),
+                    "重複擷取，完整性未通過",
+                ]
+            )
+
+            for cell in duplicate_sheet[
+                duplicate_sheet.max_row
+            ]:
+                cell.alignment = Alignment(
+                    vertical="top",
+                    wrap_text=True,
+                )
+                cell.border = Border(
+                    left=THIN_GRAY,
+                    right=THIN_GRAY,
+                    top=THIN_GRAY,
+                    bottom=THIN_GRAY,
+                )
+
+    pagination_sheet.auto_filter.ref = (
+        f"A1:R{max(1, pagination_sheet.max_row)}"
+    )
+    duplicate_sheet.auto_filter.ref = (
+        f"A1:J{max(1, duplicate_sheet.max_row)}"
+    )
 
 
 def atomic_save(
@@ -2267,105 +2692,20 @@ def click_query_button(
     timeout_ms: int,
 ) -> str:
     """
-    點擊查詢按鈕。
+    點擊第二階段查詢按鈕。
 
-    依序嘗試：
-    1. Playwright 一般點擊。
-    2. Playwright 強制點擊。
-    3. JavaScript element.click()。
-    4. 直接用 document.evaluate() 依 XPath 點擊。
+    網站的 <a onclick="..."> 會觸發表單送出與導頁。Playwright 的
+    locator.click() 可能已經成功點擊並完成導頁，卻因等待導頁結束逾時
+    而丟出 TimeoutError。這種情況不可再次點擊舊 locator，否則會把
+    已成功的查詢誤判成失敗。
     """
-    query_button = locate_query_button(
-        page
+    return click_locator_with_fallback(
+        page=page,
+        locator=locate_query_button(page),
+        exact_xpath=QUERY_BUTTON_XPATH,
+        timeout_ms=timeout_ms,
+        label="交通違規繳納記錄查詢按鈕",
     )
-
-    try:
-        query_button.scroll_into_view_if_needed(
-            timeout=min(
-                timeout_ms,
-                5000,
-            )
-        )
-    except (AttributeError, PlaywrightError):
-        pass
-
-    errors: list[str] = []
-
-    try:
-        query_button.click(
-            timeout=min(
-                timeout_ms,
-                10000,
-            ),
-        )
-        return "精確 XPath／定位器一般點擊"
-    except PlaywrightError as exc:
-        errors.append(
-            f"一般點擊：{exc}"
-        )
-
-    try:
-        query_button.click(
-            timeout=min(
-                timeout_ms,
-                10000,
-            ),
-            force=True,
-        )
-        return "精確 XPath／定位器強制點擊"
-    except PlaywrightError as exc:
-        errors.append(
-            f"強制點擊：{exc}"
-        )
-
-    try:
-        query_button.evaluate(
-            "element => element.click()"
-        )
-        return "定位器 JavaScript 點擊"
-    except Exception as exc:
-        errors.append(
-            "定位器 JavaScript 點擊："
-            f"{type(exc).__name__}: {exc}"
-        )
-
-    try:
-        clicked = page.evaluate(
-            """
-            xpath => {
-              const element = document.evaluate(
-                xpath,
-                document,
-                null,
-                XPathResult.FIRST_ORDERED_NODE_TYPE,
-                null
-              ).singleNodeValue;
-
-              if (!element) {
-                return false;
-              }
-
-              element.click();
-              return true;
-            }
-            """,
-            QUERY_BUTTON_XPATH,
-        )
-
-        if clicked:
-            return "document.evaluate() 精確 XPath 點擊"
-
-    except PlaywrightError as exc:
-        errors.append(
-            f"document.evaluate()：{exc}"
-        )
-
-    raise RuntimeError(
-        "查詢按鈕已定位，但所有點擊方式均失敗。"
-        f"指定 XPath：{QUERY_BUTTON_XPATH}；"
-        f"錯誤：{' | '.join(errors)}"
-    )
-
 
 def body_text(page: Page) -> str:
     try:
@@ -2386,6 +2726,1952 @@ def contains_any(
         pattern in text
         for pattern in patterns
     )
+
+
+def normalize_record_component(value: Any) -> str:
+    if value is None:
+        return ""
+
+    if isinstance(value, bool):
+        return "1" if value else "0"
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return normalize_text(value)
+
+
+def record_fingerprint(values: Sequence[Any]) -> str:
+    payload = [
+        normalize_record_component(value)
+        for value in values
+    ]
+
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def ensure_table_row_keys(table: ExtractedTable) -> None:
+    if len(table.row_keys) == len(table.rows):
+        return
+
+    table.row_keys = [
+        record_fingerprint(row)
+        for row in table.rows
+    ]
+
+
+def pagination_group_key(
+    section: str,
+    category: str,
+) -> tuple[str, str]:
+    return (
+        normalize_text(section),
+        normalize_text(category),
+    )
+
+
+def group_page_audits(
+    audits: Sequence[PageAudit],
+) -> dict[tuple[str, str], list[PageAudit]]:
+    grouped: dict[
+        tuple[str, str],
+        list[PageAudit],
+    ] = defaultdict(list)
+
+    for audit in audits:
+        grouped[
+            pagination_group_key(
+                audit.section,
+                audit.category,
+            )
+        ].append(audit)
+
+    for items in grouped.values():
+        items.sort(
+            key=lambda item: item.page_number
+        )
+
+    return dict(grouped)
+
+
+def page_audit_group_stats(
+    audits: Sequence[PageAudit],
+) -> dict[str, Any]:
+    if not audits:
+        return {
+            "section": "",
+            "category": "",
+            "total_pages": 0,
+            "declared_total_records": 0,
+            "visited_pages": [],
+            "extracted_count": 0,
+            "unique_count": 0,
+            "duplicate_count": 0,
+            "duplicate_keys": {},
+        }
+
+    record_keys = [
+        record_key
+        for audit in audits
+        for record_key in audit.record_keys
+    ]
+
+    counts = Counter(record_keys)
+    duplicate_keys = {
+        key: count
+        for key, count in counts.items()
+        if count > 1
+    }
+
+    return {
+        "section": audits[0].section,
+        "category": audits[0].category,
+        "total_pages": audits[0].total_pages,
+        "declared_total_records": (
+            audits[0].declared_total_records
+        ),
+        "visited_pages": [
+            audit.page_number
+            for audit in audits
+        ],
+        "extracted_count": sum(
+            audit.extracted_count
+            for audit in audits
+        ),
+        "unique_count": len(counts),
+        "duplicate_count": sum(
+            count - 1
+            for count in duplicate_keys.values()
+        ),
+        "duplicate_keys": duplicate_keys,
+    }
+
+
+def validate_page_audits(
+    audits: Sequence[PageAudit],
+) -> list[str]:
+    """
+    驗證每一組分頁：
+    1. 所有頁碼均有走訪。
+    2. 每頁宣告的總頁數與總筆數一致。
+    3. 擷取筆數等於網站宣告總筆數。
+    4. 唯一筆數等於網站宣告總筆數。
+    5. 不得有跨頁或同頁重複擷取。
+    """
+    if not audits:
+        raise DataIntegrityError(
+            "沒有任何分頁稽核資料，無法確認是否完整擷取",
+            {"audits": []},
+        )
+
+    all_duplicate_keys: list[str] = []
+
+    for group, items in group_page_audits(
+        audits
+    ).items():
+        stats = page_audit_group_stats(items)
+        total_pages_values = {
+            item.total_pages
+            for item in items
+        }
+        total_records_values = {
+            item.declared_total_records
+            for item in items
+        }
+
+        problems: list[str] = []
+
+        if len(total_pages_values) != 1:
+            problems.append(
+                "不同頁面宣告的總頁數不一致"
+            )
+
+        if len(total_records_values) != 1:
+            problems.append(
+                "不同頁面宣告的總筆數不一致"
+            )
+
+        expected_pages = set(
+            range(
+                1,
+                int(stats["total_pages"]) + 1,
+            )
+        )
+        visited_pages = set(
+            int(value)
+            for value in stats["visited_pages"]
+        )
+
+        if visited_pages != expected_pages:
+            problems.append(
+                "實際走訪頁碼不完整："
+                f"預期={sorted(expected_pages)}；"
+                f"實際={sorted(visited_pages)}"
+            )
+
+        if (
+            int(stats["extracted_count"])
+            != int(stats["declared_total_records"])
+        ):
+            problems.append(
+                "擷取筆數與網站宣告總筆數不一致："
+                f"擷取={stats['extracted_count']}；"
+                f"網站={stats['declared_total_records']}"
+            )
+
+        if (
+            int(stats["unique_count"])
+            != int(stats["declared_total_records"])
+        ):
+            problems.append(
+                "唯一資料筆數與網站宣告總筆數不一致："
+                f"唯一={stats['unique_count']}；"
+                f"網站={stats['declared_total_records']}"
+            )
+
+        if int(stats["duplicate_count"]) > 0:
+            problems.append(
+                "發現重複擷取："
+                f"{stats['duplicate_count']} 筆"
+            )
+            all_duplicate_keys.extend(
+                stats["duplicate_keys"].keys()
+            )
+
+        if problems:
+            raise DataIntegrityError(
+                (
+                    f"{group[0]}／{group[1]} 分頁完整性驗證失敗："
+                    + "；".join(problems)
+                ),
+                {
+                    "group": {
+                        "section": group[0],
+                        "category": group[1],
+                    },
+                    "stats": stats,
+                    "page_audits": [
+                        asdict(item)
+                        for item in items
+                    ],
+                    "problems": problems,
+                },
+            )
+
+    return sorted(set(all_duplicate_keys))
+
+
+def build_pagination_summary(
+    audits: Sequence[PageAudit],
+) -> str:
+    summaries: list[str] = []
+
+    for (_, _), items in group_page_audits(
+        audits
+    ).items():
+        stats = page_audit_group_stats(items)
+        summaries.append(
+            f"{stats['section']}／{stats['category']}："
+            f"{stats['total_pages']} 頁，共 "
+            f"{stats['declared_total_records']} 筆資料；"
+            f"已擷取 {stats['extracted_count']} 筆；"
+            f"唯一 {stats['unique_count']} 筆；"
+            f"重複 {stats['duplicate_count']} 筆"
+        )
+
+    return "｜".join(summaries)
+
+
+def outcome_group_summary(
+    outcome: QueryOutcome,
+    section: str,
+    category: str,
+) -> str:
+    key = pagination_group_key(
+        section,
+        category,
+    )
+    grouped = group_page_audits(
+        outcome.page_audits
+    )
+    items = grouped.get(key, [])
+
+    if not items:
+        return "未取得分頁資訊"
+
+    stats = page_audit_group_stats(items)
+
+    return (
+        f"{stats['total_pages']} 頁，共 "
+        f"{stats['declared_total_records']} 筆資料；"
+        f"已擷取 {stats['extracted_count']} 筆；"
+        f"唯一 {stats['unique_count']} 筆；"
+        f"重複 {stats['duplicate_count']} 筆"
+    )
+
+
+def outcome_integrity_text(
+    outcome: QueryOutcome,
+) -> str:
+    if outcome.status != STATUS_SUCCESS:
+        return "未通過"
+
+    if not outcome.page_audits:
+        return "未取得分頁稽核資料"
+
+    return f"{PAGINATION_VERIFIED_MARKER}；全部頁碼與總筆數一致"
+
+
+def outcome_duplicate_text(
+    outcome: QueryOutcome,
+) -> str:
+    if outcome.duplicate_keys:
+        return f"發現 {len(outcome.duplicate_keys)} 組重複資料"
+
+    if outcome.status == STATUS_SUCCESS:
+        return "無重複擷取（0 筆）"
+
+    return "未完成檢查"
+
+
+def read_pagination_info(
+    page: Page,
+    banner_xpath: str,
+    section: str,
+    category: str,
+) -> PaginationInfo | None:
+    """
+    讀取目前分頁資訊。
+
+    優先使用指定 XPath；若網站微調 DOM，則尋找 span#showbanner 或
+    內含 txtPage/goPage 的 span。只有找到候選節點但內容無法解析時才
+    報完整性錯誤；完全沒有候選時回傳 None，交由單頁判斷處理。
+    """
+    if not page_is_open(page):
+        raise RuntimeError(
+            "Target page, context or browser has been closed"
+        )
+
+    candidates = (
+        page.locator(f"xpath={banner_xpath}"),
+        page.locator("span#showbanner"),
+        page.locator(
+            "span:has(input[name='txtPage']), "
+            "span:has(input#goPage)"
+        ),
+    )
+
+    candidate_payloads: list[dict[str, Any]] = []
+    seen_handles: set[str] = set()
+
+    for locator in candidates:
+        try:
+            count = locator.count()
+        except PlaywrightError:
+            continue
+
+        for index in range(count):
+            item = locator.nth(index)
+
+            try:
+                if not item.is_visible():
+                    continue
+
+                payload = item.evaluate(
+                    """
+                    element => {
+                      const norm = value => (value || '')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+
+                      const pageInput = element.querySelector(
+                        "input[name='txtPage'], input#goPage"
+                      );
+                      const totalInput = element.querySelector(
+                        "input[name='total'], input#total"
+                      );
+
+                      return {
+                        key: [
+                          element.tagName || '',
+                          element.id || '',
+                          element.className || '',
+                          norm(element.textContent)
+                        ].join('|'),
+                        text: norm(element.innerText),
+                        textContent: norm(element.textContent),
+                        currentPage: pageInput?.value || '',
+                        totalPages: totalInput?.value || ''
+                      };
+                    }
+                    """
+                )
+            except PlaywrightError:
+                continue
+
+            key = normalize_text(payload.get("key"))
+            if key in seen_handles:
+                continue
+            seen_handles.add(key)
+            candidate_payloads.append(payload)
+
+    if not candidate_payloads:
+        return None
+
+    parse_errors: list[dict[str, Any]] = []
+
+    for payload in candidate_payloads:
+        raw_text = normalize_text(
+            payload.get("text")
+            or payload.get("textContent")
+        )
+        current_text = normalize_text(
+            payload.get("currentPage")
+        )
+        total_pages_text = normalize_text(
+            payload.get("totalPages")
+        )
+
+        total_pages_match = re.search(
+            r"/\s*([\d,，]+)\s*頁",
+            raw_text,
+        )
+        total_records_match = re.search(
+            r"共\s*([\d,，]+)\s*筆(?:資料)?",
+            raw_text,
+        )
+
+        if not current_text or not re.fullmatch(
+            r"\d+",
+            current_text,
+        ):
+            current_match = re.search(
+                r"([\d,，]+)\s*/\s*[\d,，]+\s*頁",
+                raw_text,
+            )
+            current_text = (
+                current_match.group(1)
+                if current_match
+                else ""
+            )
+
+        if not total_pages_text or not re.fullmatch(
+            r"\d+",
+            total_pages_text,
+        ):
+            total_pages_text = (
+                total_pages_match.group(1)
+                if total_pages_match
+                else ""
+            )
+
+        if not (
+            current_text
+            and total_pages_text
+            and total_records_match
+        ):
+            parse_errors.append(
+                {
+                    "raw_text": raw_text,
+                    "payload": payload,
+                }
+            )
+            continue
+
+        current_page = int(
+            re.sub(r"[,，]", "", current_text)
+        )
+        total_pages = max(
+            1,
+            int(
+                re.sub(
+                    r"[,，]",
+                    "",
+                    total_pages_text,
+                )
+            ),
+        )
+        declared_total_records = int(
+            re.sub(
+                r"[,，]",
+                "",
+                total_records_match.group(1),
+            )
+        )
+
+        if not (1 <= current_page <= total_pages):
+            parse_errors.append(
+                {
+                    "current_page": current_page,
+                    "total_pages": total_pages,
+                    "raw_text": raw_text,
+                }
+            )
+            continue
+
+        banner_text = (
+            f"{current_page} / {total_pages} 頁，共 "
+            f"{declared_total_records} 筆資料"
+        )
+
+        return PaginationInfo(
+            section=section,
+            category=category,
+            current_page=current_page,
+            total_pages=total_pages,
+            declared_total_records=(
+                declared_total_records
+            ),
+            banner_text=banner_text,
+            raw_text=raw_text,
+        )
+
+    raise DataIntegrityError(
+        f"分頁資訊格式無法解析：{section}／{category}",
+        {
+            "xpath": banner_xpath,
+            "candidates": parse_errors,
+            "result_url": safe_page_url(page),
+        },
+    )
+
+def inspect_pagination_evidence(
+    page: Page,
+    banner_xpath: str,
+) -> dict[str, Any]:
+    """
+    檢查頁面是否真的存在多頁控制項。
+
+    單頁結果常只有空的 span#pagebanner，沒有 showbanner、goPage、total、
+    Go 或上一頁／下一頁。空 pagebanner 不算分頁證據。
+    """
+    if not page_is_open(page):
+        raise RuntimeError(
+            "Target page, context or browser has been closed"
+        )
+
+    try:
+        return page.evaluate(
+            """
+            xpath => {
+              const norm = value => (value || '')
+                .replace(/\\s+/g, ' ')
+                .trim();
+
+              const exact = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+              ).singleNodeValue;
+
+              const selectors = [
+                "input[name='txtPage']",
+                "input#goPage",
+                "input[name='total']",
+                "input#total",
+                "a#goUrl",
+                "button#goUrl",
+                "input[value='Go']",
+                "button"
+              ];
+
+              const controls = [];
+              for (const selector of selectors) {
+                for (const element of document.querySelectorAll(selector)) {
+                  const text = norm([
+                    element.tagName || '',
+                    element.id || '',
+                    element.getAttribute('name') || '',
+                    element.getAttribute('value') || '',
+                    element.getAttribute('href') || '',
+                    element.innerText || ''
+                  ].join(' '));
+
+                  if (
+                    selector === 'button'
+                    && !/^(Go|下一頁|下頁|上一頁|上頁)$/i.test(
+                      norm(element.innerText)
+                    )
+                  ) {
+                    continue;
+                  }
+
+                  controls.push(text);
+                }
+              }
+
+              const bannerTexts = [
+                ...document.querySelectorAll(
+                  "span#showbanner, span#pagebanner"
+                )
+              ]
+                .map(element => norm(element.textContent))
+                .filter(Boolean);
+
+              const paginationText = bannerTexts.find(text =>
+                /\\d+\\s*\\/\\s*\\d+\\s*頁/.test(text)
+                || /共\\s*\\d+\\s*筆/.test(text)
+              ) || '';
+
+              return {
+                exactBannerFound: Boolean(exact),
+                exactBannerText: norm(exact?.textContent || ''),
+                controls,
+                bannerTexts,
+                paginationText,
+                hasEvidence: Boolean(
+                  controls.length > 0 || paginationText
+                )
+              };
+            }
+            """,
+            banner_xpath,
+        )
+    except PlaywrightError as exc:
+        if is_browser_session_closed_exception(exc):
+            raise
+        return {
+            "exactBannerFound": False,
+            "exactBannerText": "",
+            "controls": [],
+            "bannerTexts": [],
+            "paginationText": "",
+            "hasEvidence": False,
+            "inspection_error": (
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+
+def build_single_page_info(
+    section: str,
+    category: str,
+    extracted_count: int,
+) -> PaginationInfo:
+    return PaginationInfo(
+        section=section,
+        category=category,
+        current_page=1,
+        total_pages=1,
+        declared_total_records=extracted_count,
+        banner_text=(
+            f"1 / 1 頁，共 {extracted_count} 筆資料"
+            "（單頁，網站未顯示分頁列）"
+        ),
+        raw_text=(
+            "單頁結果：網站未產生 showbanner/goPage/total；"
+            f"依目標結果表格確認 {extracted_count} 筆"
+        ),
+    )
+
+
+def read_scoped_pagination_controls(
+    page: Page,
+    banner_xpath: str,
+) -> dict[str, Any] | None:
+    """
+    讀取「目前結果表格所屬 pagebar」的分頁控制項。
+
+    網站同一頁可能存在重複的 id，例如：
+    - previous
+    - next
+    - goUrl
+    - goPage
+    - total
+
+    因此不可使用 document.querySelector() 直接拿整頁第一個控制項。
+    本函式先依指定 XPath 找到目前類別的 showbanner，再限制在其所屬
+    .pagebar 內讀取上一頁、下一頁與 Go 連結。
+    """
+    if not page_is_open(page):
+        raise RuntimeError(
+            "Target page, context or browser has been closed"
+        )
+
+    try:
+        payload = page.evaluate(
+            r"""
+            xpath => {
+              const norm = value => (value || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+              const visible = element => {
+                if (!element) {
+                  return false;
+                }
+
+                const style = getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+
+                return (
+                  style.visibility !== 'hidden'
+                  && style.display !== 'none'
+                  && rect.width > 0
+                  && rect.height > 0
+                );
+              };
+
+              let exact = document.evaluate(
+                xpath,
+                document,
+                null,
+                XPathResult.FIRST_ORDERED_NODE_TYPE,
+                null
+              ).singleNodeValue;
+
+              if (exact && !visible(exact)) {
+                exact = null;
+              }
+
+              const semantic = [
+                ...document.querySelectorAll(
+                  "span#showbanner, span"
+                )
+              ].find(element => (
+                visible(element)
+                && element.querySelector(
+                  "input[name='txtPage'], input#goPage"
+                )
+              ));
+
+              const banner = exact || semantic || null;
+
+              if (!banner) {
+                return null;
+              }
+
+              const pagebar = (
+                banner.closest('.pagebar')
+                || banner.parentElement
+                || null
+              );
+
+              if (!pagebar) {
+                return null;
+              }
+
+              const previous = pagebar.querySelector(
+                "a#previous, a[rel='prev']"
+              );
+
+              const next = pagebar.querySelector(
+                "a#next, a[rel='next']"
+              );
+
+              const go = pagebar.querySelector(
+                "a#goUrl, button#goUrl, "
+                + "a[href*='method=pagination'], "
+                + "a[href*='method=nopayPagination']"
+              );
+
+              const pageInput = (
+                banner.querySelector(
+                  "input[name='txtPage'], input#goPage"
+                )
+                || pagebar.querySelector(
+                  "input[name='txtPage'], input#goPage"
+                )
+              );
+
+              const totalInput = (
+                banner.querySelector(
+                  "input[name='total'], input#total"
+                )
+                || pagebar.querySelector(
+                  "input[name='total'], input#total"
+                )
+              );
+
+              const rawHref = element => (
+                element?.getAttribute('href') || ''
+              );
+
+              const absoluteHref = element => (
+                element?.href || ''
+              );
+
+              return {
+                currentPage: pageInput?.value || '',
+                totalPages: totalInput?.value || '',
+                previousHref: rawHref(previous),
+                previousUrl: absoluteHref(previous),
+                nextHref: rawHref(next),
+                nextUrl: absoluteHref(next),
+                goHref: rawHref(go),
+                goUrl: absoluteHref(go),
+                bannerText: norm(banner.textContent),
+                pagebarText: norm(pagebar.innerText),
+                pagebarHtml: pagebar.outerHTML || '',
+                location: window.location.href
+              };
+            }
+            """,
+            banner_xpath,
+        )
+    except PlaywrightError as exc:
+        if is_browser_session_closed_exception(exc):
+            raise
+
+        raise DataIntegrityError(
+            "無法讀取目前結果表格的分頁控制項",
+            {
+                "xpath": banner_xpath,
+                "exception": (
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                "result_url": safe_page_url(page),
+            },
+        ) from exc
+
+    if not isinstance(payload, dict):
+        return None
+
+    return {
+        str(key): value
+        for key, value in payload.items()
+    }
+
+
+def pagination_parameter_from_url(
+    value: str,
+) -> str:
+    """
+    從 DisplayTag 分頁網址找出頁碼 query parameter。
+
+    監理服務網目前常見形式：
+        d-49440-p
+        d-2637073-p
+
+    不把 method、tab 等其他數字欄位誤認成頁碼。
+    """
+    text = normalize_text(value)
+
+    if not text:
+        return ""
+
+    try:
+        query_items = parse_qsl(
+            urlsplit(text).query,
+            keep_blank_values=True,
+        )
+    except ValueError:
+        query_items = []
+
+    for key, _ in query_items:
+        if re.search(
+            r"(?:^|[-_])p$",
+            key,
+            re.I,
+        ):
+            return key
+
+    match = re.search(
+        r"[?&]([^=&?#]+(?:-|_)p)="
+        r"\d+",
+        text,
+        re.I,
+    )
+
+    return (
+        normalize_text(match.group(1))
+        if match
+        else ""
+    )
+
+
+def pagination_page_from_url(
+    value: str,
+    parameter: str,
+) -> int | None:
+    if not value or not parameter:
+        return None
+
+    try:
+        query_items = parse_qsl(
+            urlsplit(value).query,
+            keep_blank_values=True,
+        )
+    except ValueError:
+        return None
+
+    for key, raw_value in query_items:
+        if key != parameter:
+            continue
+
+        compact = re.sub(
+            r"[,，\s]",
+            "",
+            normalize_text(raw_value),
+        )
+
+        if compact.isdigit():
+            return int(compact)
+
+    return None
+
+
+def replace_pagination_page_in_url(
+    value: str,
+    parameter: str,
+    target_page: int,
+) -> str:
+    """
+    保留原本 method、其他 query parameter 與 #anchor，
+    只替換目前 pagebar 的 DisplayTag 頁碼。
+    """
+    if not value or not parameter:
+        return ""
+
+    parts = urlsplit(value)
+    query_items = parse_qsl(
+        parts.query,
+        keep_blank_values=True,
+    )
+
+    replaced = False
+    output_items: list[
+        tuple[str, str]
+    ] = []
+
+    for key, raw_value in query_items:
+        if key == parameter:
+            output_items.append(
+                (
+                    key,
+                    str(target_page),
+                )
+            )
+            replaced = True
+        else:
+            output_items.append(
+                (
+                    key,
+                    raw_value,
+                )
+            )
+
+    if not replaced:
+        output_items.append(
+            (
+                parameter,
+                str(target_page),
+            )
+        )
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(
+                output_items,
+                doseq=True,
+            ),
+            parts.fragment,
+        )
+    )
+
+
+def build_pagination_target_url(
+    current_url: str,
+    controls: dict[str, Any],
+    target_page: int,
+) -> tuple[str, str, str]:
+    """
+    由目前 pagebar 的上一頁／下一頁連結建立目標網址。
+
+    優先規則：
+    1. 下一頁或上一頁連結本身已指向 target_page，直接使用。
+    2. 以目前 pagebar 的相鄰頁連結為基底，只替換其頁碼參數。
+    3. 最後才使用 Go 連結。
+
+    這裡不依賴 changePage() 產生的 href。實際錯誤紀錄顯示，在第 2 頁
+    要前往第 3 頁時，changePage() 產生的 navigation_url 反而是第 1
+    頁；但同一個 pagebar 的 next href 正確指向第 3 頁。
+    """
+    try:
+        current_page = int(
+            normalize_text(
+                controls.get("currentPage")
+            )
+            or "0"
+        )
+    except ValueError:
+        current_page = 0
+
+    href_entries = [
+        (
+            "next",
+            normalize_text(
+                controls.get("nextUrl")
+                or controls.get("nextHref")
+            ),
+        ),
+        (
+            "previous",
+            normalize_text(
+                controls.get("previousUrl")
+                or controls.get("previousHref")
+            ),
+        ),
+        (
+            "go",
+            normalize_text(
+                controls.get("goUrl")
+                or controls.get("goHref")
+            ),
+        ),
+    ]
+
+    absolute_entries: list[
+        tuple[str, str]
+    ] = []
+
+    for label, href in href_entries:
+        if not href or href == "#":
+            continue
+
+        absolute_entries.append(
+            (
+                label,
+                urljoin(
+                    current_url,
+                    href,
+                ),
+            )
+        )
+
+    if target_page == current_page + 1:
+        preferred_labels = (
+            "next",
+            "previous",
+            "go",
+        )
+    elif target_page == current_page - 1:
+        preferred_labels = (
+            "previous",
+            "next",
+            "go",
+        )
+    else:
+        preferred_labels = (
+            "next",
+            "previous",
+            "go",
+        )
+
+    ordered_entries = sorted(
+        absolute_entries,
+        key=lambda item: (
+            preferred_labels.index(
+                item[0]
+            )
+            if item[0] in preferred_labels
+            else len(preferred_labels)
+        ),
+    )
+
+    # 相鄰頁連結若已經正確指向目標頁，完全不修改它。
+    for label, absolute_url in ordered_entries:
+        parameter = pagination_parameter_from_url(
+            absolute_url
+        )
+
+        if not parameter:
+            continue
+
+        page_number = pagination_page_from_url(
+            absolute_url,
+            parameter,
+        )
+
+        if page_number == target_page:
+            return (
+                absolute_url,
+                parameter,
+                f"{label} 連結直接指向目標頁",
+            )
+
+    # 找到目前 pagebar 真正使用的頁碼參數。
+    parameter = ""
+
+    for _, absolute_url in ordered_entries:
+        parameter = pagination_parameter_from_url(
+            absolute_url
+        )
+
+        if parameter:
+            break
+
+    if not parameter:
+        parameter = pagination_parameter_from_url(
+            current_url
+        )
+
+    if not parameter:
+        return "", "", "找不到 DisplayTag 頁碼參數"
+
+    for label, absolute_url in ordered_entries:
+        target_url = replace_pagination_page_in_url(
+            absolute_url,
+            parameter,
+            target_page,
+        )
+
+        if target_url:
+            return (
+                target_url,
+                parameter,
+                f"以 {label} 連結為基底替換頁碼",
+            )
+
+    return "", parameter, "pagebar 沒有可用連結"
+
+
+def pagination_page_signature(
+    page: Page,
+) -> str:
+    """
+    取得目前頁面實際顯示內容的簽章。
+
+    此簽章只用來判斷頁面是否已穩定，不再把「內容必須與上一頁不同」
+    當成導頁成功的唯一依據。是否真正到達目標頁，改由：
+    - 伺服器回傳後的 URL query parameter；
+    - showbanner/goPage 的目前頁碼
+    共同確認。
+
+    若網站真的在兩頁回傳重複紀錄，後續 record key 稽核仍會攔截。
+    """
+    text = body_text(page)
+
+    if not text:
+        return ""
+
+    return hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+
+
+def wait_for_pagination_page(
+    page: Page,
+    banner_xpath: str,
+    section: str,
+    category: str,
+    target_page: int,
+    before_signature: str,
+    timeout_ms: int,
+    expected_parameter: str = "",
+) -> bool:
+    """
+    等待伺服器真正回傳目標頁。
+
+    驗證條件：
+    1. showbanner/goPage 顯示 target_page。
+    2. 若已知 DisplayTag 參數，最終 URL 中該參數也必須是 target_page。
+    3. 目前 DOM 連續兩次保持穩定。
+
+    不再只看 input.value，也不強迫資料一定與上一頁不同；重複資料由
+    validate_page_audits() 負責檢出。
+    """
+    del before_signature
+
+    deadline = time.monotonic() + min(
+        max(timeout_ms, 1000),
+        30000,
+    ) / 1000.0
+
+    stable_count = 0
+    last_signature = ""
+
+    while time.monotonic() < deadline:
+        if not page_is_open(page):
+            raise RuntimeError(
+                "Target page, context or browser has been closed"
+            )
+
+        try:
+            page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=500,
+            )
+        except PlaywrightTimeoutError:
+            pass
+        except PlaywrightError as exc:
+            if is_browser_session_closed_exception(exc):
+                raise
+
+        try:
+            info = read_pagination_info(
+                page,
+                banner_xpath,
+                section,
+                category,
+            )
+        except DataIntegrityError:
+            info = None
+
+        url_page = (
+            pagination_page_from_url(
+                safe_page_url(page),
+                expected_parameter,
+            )
+            if expected_parameter
+            else None
+        )
+
+        url_matches = (
+            url_page == target_page
+            if expected_parameter
+            else True
+        )
+
+        if (
+            info is not None
+            and info.current_page == target_page
+            and url_matches
+        ):
+            signature = pagination_page_signature(
+                page
+            )
+
+            if signature:
+                if signature == last_signature:
+                    stable_count += 1
+                else:
+                    last_signature = signature
+                    stable_count = 1
+
+                if stable_count >= 2:
+                    return True
+        else:
+            stable_count = 0
+            last_signature = ""
+
+        time.sleep(0.25)
+
+    return False
+
+
+def navigate_to_pagination_page(
+    page: Page,
+    banner_xpath: str,
+    section: str,
+    category: str,
+    target_page: int,
+    timeout_ms: int,
+) -> None:
+    """
+    使用目前 pagebar 的「正確相鄰頁連結」切換分頁。
+
+    本版不再信任 changePage(input) 產生的 goUrl。實際執行紀錄顯示：
+    - 當前頁：2
+    - 目標頁：3
+    - next href：第 3 頁
+    - changePage 產生的 navigation_url：第 1 頁
+
+    因此現在直接使用該 pagebar 的 next／previous href，或以其網址中的
+    DisplayTag 參數建立 target_page URL，再由 page.goto() 向伺服器
+    載入。這可避免第 2 頁與第 1 頁之間來回跳轉。
+    """
+    current_info = read_pagination_info(
+        page,
+        banner_xpath,
+        section,
+        category,
+    )
+
+    if current_info is None:
+        raise DataIntegrityError(
+            f"找不到分頁資訊，無法前往第 {target_page} 頁："
+            f"{section}／{category}",
+            {
+                "xpath": banner_xpath,
+                "result_url": safe_page_url(page),
+            },
+        )
+
+    if current_info.current_page == target_page:
+        return
+
+    if not (
+        1
+        <= target_page
+        <= current_info.total_pages
+    ):
+        raise DataIntegrityError(
+            f"要求前往的頁碼超出範圍：第 {target_page} 頁",
+            {
+                "section": section,
+                "category": category,
+                "current_page": (
+                    current_info.current_page
+                ),
+                "total_pages": (
+                    current_info.total_pages
+                ),
+            },
+        )
+
+    before_url = safe_page_url(page)
+    before_signature = pagination_page_signature(
+        page
+    )
+    errors: list[str] = []
+
+    controls = read_scoped_pagination_controls(
+        page,
+        banner_xpath,
+    )
+
+    if controls is None:
+        raise DataIntegrityError(
+            "已讀到分頁資訊，但找不到其所屬 pagebar 控制項",
+            {
+                "xpath": banner_xpath,
+                "target_page": target_page,
+                "result_url": before_url,
+            },
+        )
+
+    (
+        target_url,
+        page_parameter,
+        target_url_source,
+    ) = build_pagination_target_url(
+        before_url,
+        controls,
+        target_page,
+    )
+
+    if target_url:
+        try:
+            response = page.goto(
+                target_url,
+                wait_until="domcontentloaded",
+                timeout=timeout_ms,
+            )
+
+            if response is not None:
+                status = int(response.status)
+
+                if status >= 400:
+                    errors.append(
+                        "目標分頁 HTTP 狀態："
+                        f"{status}"
+                    )
+
+        except PlaywrightTimeoutError as exc:
+            errors.append(
+                "前往目標分頁 URL："
+                f"{type(exc).__name__}: {exc}"
+            )
+        except PlaywrightError as exc:
+            if is_browser_session_closed_exception(exc):
+                raise
+
+            errors.append(
+                "前往目標分頁 URL："
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if wait_for_pagination_page(
+            page=page,
+            banner_xpath=banner_xpath,
+            section=section,
+            category=category,
+            target_page=target_page,
+            before_signature=before_signature,
+            timeout_ms=min(
+                timeout_ms,
+                15000,
+            ),
+            expected_parameter=page_parameter,
+        ):
+            return
+
+    # page.goto() 未通過時，才點擊同一個 pagebar 內的相鄰頁連結。
+    try:
+        banner_locator = page.locator(
+            f"xpath={banner_xpath}"
+        ).first
+
+        if banner_locator.count() <= 0:
+            banner_locator = page.locator(
+                "span#showbanner:visible"
+            ).first
+
+        pagebar = banner_locator.locator(
+            "xpath=ancestor::*"
+            "[contains(concat(' ', normalize-space(@class), ' '), "
+            "' pagebar ')][1]"
+        )
+
+        current_page_now = read_pagination_info(
+            page,
+            banner_xpath,
+            section,
+            category,
+        )
+
+        current_number = (
+            current_page_now.current_page
+            if current_page_now is not None
+            else current_info.current_page
+        )
+
+        if target_page > current_number:
+            adjacent = pagebar.locator(
+                "a#next, a[rel='next']"
+            ).first
+            adjacent_label = "下一頁"
+        else:
+            adjacent = pagebar.locator(
+                "a#previous, a[rel='prev']"
+            ).first
+            adjacent_label = "上一頁"
+
+        if adjacent.count() > 0:
+            adjacent_href = normalize_text(
+                adjacent.get_attribute(
+                    "href"
+                )
+            )
+            adjacent_url = (
+                urljoin(
+                    safe_page_url(page),
+                    adjacent_href,
+                )
+                if adjacent_href
+                else ""
+            )
+            adjacent_parameter = (
+                pagination_parameter_from_url(
+                    adjacent_url
+                )
+            )
+
+            # 相鄰連結未必直接等於目標頁；必要時只替換其頁碼。
+            if adjacent_url and adjacent_parameter:
+                adjacent_url = (
+                    replace_pagination_page_in_url(
+                        adjacent_url,
+                        adjacent_parameter,
+                        target_page,
+                    )
+                )
+
+            if adjacent_url:
+                try:
+                    page.goto(
+                        adjacent_url,
+                        wait_until="domcontentloaded",
+                        timeout=timeout_ms,
+                    )
+                except PlaywrightTimeoutError as exc:
+                    errors.append(
+                        f"{adjacent_label}連結導頁："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except PlaywrightError as exc:
+                    if is_browser_session_closed_exception(exc):
+                        raise
+
+                    errors.append(
+                        f"{adjacent_label}連結導頁："
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+                if wait_for_pagination_page(
+                    page=page,
+                    banner_xpath=banner_xpath,
+                    section=section,
+                    category=category,
+                    target_page=target_page,
+                    before_signature=before_signature,
+                    timeout_ms=min(
+                        timeout_ms,
+                        15000,
+                    ),
+                    expected_parameter=(
+                        adjacent_parameter
+                    ),
+                ):
+                    return
+
+    except PlaywrightError as exc:
+        if is_browser_session_closed_exception(exc):
+            raise
+
+        errors.append(
+            "相鄰頁連結備援："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    final_info = read_pagination_info(
+        page,
+        banner_xpath,
+        section,
+        category,
+    )
+
+    raise DataIntegrityError(
+        f"無法由伺服器載入第 {target_page} 頁："
+        f"{section}／{category}",
+        {
+            "xpath": banner_xpath,
+            "target_page": target_page,
+            "current_page": (
+                final_info.current_page
+                if final_info is not None
+                else None
+            ),
+            "total_pages": (
+                current_info.total_pages
+            ),
+            "before_url": before_url,
+            "target_url": target_url,
+            "target_url_source": (
+                target_url_source
+            ),
+            "page_parameter": (
+                page_parameter
+            ),
+            "result_url": safe_page_url(page),
+            "controls": controls,
+            "errors": errors,
+        },
+    )
+
+
+def attach_pagination_to_tables(
+    tables: Sequence[ExtractedTable],
+    info: PaginationInfo,
+) -> list[ExtractedTable]:
+    output: list[ExtractedTable] = []
+
+    for table in tables:
+        table.section = info.section
+        table.category = info.category
+        table.page_number = info.current_page
+        table.total_pages = info.total_pages
+        table.declared_total_records = (
+            info.declared_total_records
+        )
+        table.banner_text = info.banner_text
+        ensure_table_row_keys(table)
+        output.append(table)
+
+    return output
+
+
+def capture_paginated_group(
+    page: Page,
+    *,
+    banner_xpath: str,
+    section: str,
+    category: str,
+    extractor: Any,
+    timeout_ms: int,
+    max_pages: int = 1000,
+) -> tuple[list[ExtractedTable], list[PageAudit]]:
+    """
+    逐頁擷取單一結果類別，並驗證頁碼、總筆數與重複資料。
+
+    單頁結果的網站不一定輸出 showbanner/goPage/total。這時只有在：
+    - 已成功擷取目標資料表；且
+    - 頁面完全沒有任何分頁控制證據
+    才會建立 1/1 的稽核資料。若仍存在 goPage、total 或 Go，則絕不
+    擅自判定單頁，以免再次漏抓。
+    """
+    initial_info = read_pagination_info(
+        page,
+        banner_xpath,
+        section,
+        category,
+    )
+
+    if initial_info is None:
+        tables = list(extractor())
+        extracted_count = sum(
+            table.record_count
+            for table in tables
+        )
+        text = body_text(page)
+        evidence = inspect_pagination_evidence(
+            page,
+            banner_xpath,
+        )
+
+        if (
+            extracted_count == 0
+            and contains_any(text, NO_DATA_PATTERNS)
+        ):
+            synthetic = build_single_page_info(
+                section,
+                category,
+                0,
+            )
+            audit = PageAudit(
+                section=section,
+                category=category,
+                page_number=1,
+                total_pages=1,
+                declared_total_records=0,
+                banner_text=synthetic.banner_text,
+                extracted_count=0,
+                record_keys=[],
+                result_url=safe_page_url(page),
+            )
+            validate_page_audits([audit])
+            return [], [audit]
+
+        if extracted_count > 0 and not bool(
+            evidence.get("hasEvidence")
+        ):
+            synthetic = build_single_page_info(
+                section,
+                category,
+                extracted_count,
+            )
+            tables = attach_pagination_to_tables(
+                tables,
+                synthetic,
+            )
+            record_keys = [
+                record_key
+                for table in tables
+                for record_key in table.row_keys
+            ]
+            audit = PageAudit(
+                section=section,
+                category=category,
+                page_number=1,
+                total_pages=1,
+                declared_total_records=extracted_count,
+                banner_text=synthetic.banner_text,
+                extracted_count=extracted_count,
+                record_keys=record_keys,
+                result_url=safe_page_url(page),
+            )
+            validate_page_audits([audit])
+            return tables, [audit]
+
+        raise DataIntegrityError(
+            f"找不到可解析的分頁資訊，無法驗證完整筆數："
+            f"{section}／{category}",
+            {
+                "xpath": banner_xpath,
+                "extracted_count": extracted_count,
+                "pagination_evidence": evidence,
+                "body_excerpt": text[:2000],
+                "result_url": safe_page_url(page),
+            },
+        )
+
+    if initial_info.total_pages > max_pages:
+        raise DataIntegrityError(
+            f"網站宣告頁數 {initial_info.total_pages} 超過安全上限 {max_pages}",
+            asdict(initial_info),
+        )
+
+    if initial_info.current_page != 1:
+        navigate_to_pagination_page(
+            page=page,
+            banner_xpath=banner_xpath,
+            section=section,
+            category=category,
+            target_page=1,
+            timeout_ms=timeout_ms,
+        )
+
+    all_tables: list[ExtractedTable] = []
+    audits: list[PageAudit] = []
+
+    for target_page in range(
+        1,
+        initial_info.total_pages + 1,
+    ):
+        if target_page > 1:
+            navigate_to_pagination_page(
+                page=page,
+                banner_xpath=banner_xpath,
+                section=section,
+                category=category,
+                target_page=target_page,
+                timeout_ms=timeout_ms,
+            )
+
+        info = read_pagination_info(
+            page,
+            banner_xpath,
+            section,
+            category,
+        )
+
+        if info is None:
+            raise DataIntegrityError(
+                f"第 {target_page} 頁找不到分頁資訊："
+                f"{section}／{category}",
+                {"xpath": banner_xpath},
+            )
+
+        if info.current_page != target_page:
+            raise DataIntegrityError(
+                f"頁碼切換失敗：預期第 {target_page} 頁，"
+                f"實際第 {info.current_page} 頁",
+                asdict(info),
+            )
+
+        if (
+            info.total_pages != initial_info.total_pages
+            or info.declared_total_records
+            != initial_info.declared_total_records
+        ):
+            raise DataIntegrityError(
+                "不同頁面顯示的總頁數或總筆數不一致",
+                {
+                    "initial": asdict(initial_info),
+                    "current": asdict(info),
+                },
+            )
+
+        extraction_deadline = time.monotonic() + min(
+            max(timeout_ms, 1000),
+            12000,
+        ) / 1000.0
+        page_tables: list[ExtractedTable] = []
+        page_keys: list[str] = []
+        extracted_count = 0
+        previous_page_keys = (
+            audits[-1].record_keys
+            if audits
+            else []
+        )
+
+        while time.monotonic() < extraction_deadline:
+            page_tables = attach_pagination_to_tables(
+                list(extractor()),
+                info,
+            )
+            page_keys = [
+                record_key
+                for table in page_tables
+                for record_key in table.row_keys
+            ]
+            extracted_count = sum(
+                table.record_count
+                for table in page_tables
+            )
+
+            nonempty_ready = (
+                info.declared_total_records == 0
+                or extracted_count > 0
+            )
+            not_stale_previous_page = not (
+                target_page > 1
+                and page_keys
+                and page_keys == previous_page_keys
+            )
+
+            if nonempty_ready and not_stale_previous_page:
+                break
+
+            time.sleep(0.25)
+
+        if (
+            info.declared_total_records > 0
+            and extracted_count <= 0
+        ):
+            raise DataIntegrityError(
+                f"網站宣告共 {info.declared_total_records} 筆，"
+                f"但第 {target_page} 頁沒有擷取到任何資料",
+                {
+                    "pagination": asdict(info),
+                    "result_url": safe_page_url(page),
+                },
+            )
+
+        if (
+            target_page > 1
+            and page_keys
+            and page_keys == previous_page_keys
+        ):
+            raise DataIntegrityError(
+                f"第 {target_page} 頁內容仍與前一頁完全相同，"
+                "可能尚未切頁或發生重複擷取",
+                {
+                    "pagination": asdict(info),
+                    "previous_page_keys": previous_page_keys,
+                    "current_page_keys": page_keys,
+                    "result_url": safe_page_url(page),
+                },
+            )
+
+        audits.append(
+            PageAudit(
+                section=section,
+                category=category,
+                page_number=target_page,
+                total_pages=info.total_pages,
+                declared_total_records=(
+                    info.declared_total_records
+                ),
+                banner_text=info.banner_text,
+                extracted_count=extracted_count,
+                record_keys=page_keys,
+                result_url=safe_page_url(page),
+            )
+        )
+        all_tables.extend(page_tables)
+
+    validate_page_audits(audits)
+
+    return all_tables, audits
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(
+        value,
+        (str, int, float, bool),
+    ):
+        return value
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if hasattr(value, "__dataclass_fields__"):
+        return {
+            key: json_safe(item)
+            for key, item in asdict(value).items()
+        }
+
+    if isinstance(value, dict):
+        return {
+            str(key): json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [
+            json_safe(item)
+            for item in value
+        ]
+
+    return normalize_text(value)
+
+
+def write_error_json(
+    error_log_dir: Path,
+    company: CompanyRow,
+    phase: str,
+    message: str,
+    *,
+    page: Page | None = None,
+    exception: BaseException | None = None,
+    outcome: QueryOutcome | None = None,
+    details: dict[str, Any] | None = None,
+) -> Path:
+    error_log_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    timestamp = datetime.now()
+    safe_phase = re.sub(
+        r"[^A-Za-z0-9_-]",
+        "_",
+        phase,
+    )[:60]
+    filename = (
+        f"{company.query_id}_"
+        f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')}_"
+        f"{safe_phase}.json"
+    )
+    path = error_log_dir / filename
+
+    payload: dict[str, Any] = {
+        "timestamp": timestamp.isoformat(),
+        "phase": phase,
+        "company": asdict(company),
+        "message": message,
+        "result_url": (
+            safe_page_url(page)
+            if page is not None
+            else (
+                outcome.result_url
+                if outcome is not None
+                else ""
+            )
+        ),
+        "details": details or {},
+    }
+
+    if exception is not None:
+        payload["exception"] = {
+            "type": type(exception).__name__,
+            "message": str(exception),
+            "traceback": "".join(
+                traceback.format_exception(
+                    type(exception),
+                    exception,
+                    exception.__traceback__,
+                )
+            ),
+        }
+
+        if isinstance(
+            exception,
+            DataIntegrityError,
+        ):
+            payload["integrity_details"] = (
+                exception.details
+            )
+
+    if outcome is not None:
+        payload["outcome"] = {
+            "status": outcome.status,
+            "record_count": outcome.record_count,
+            "message": outcome.message,
+            "retry_later": outcome.retry_later,
+            "duplicate_keys": outcome.duplicate_keys,
+            "page_audits": [
+                asdict(item)
+                for item in outcome.page_audits
+            ],
+        }
+
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(
+            json_safe(payload),
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
+    latest_path = error_log_dir / (
+        f"{company.query_id}_latest.json"
+    )
+
+    try:
+        shutil.copy2(path, latest_path)
+    except OSError:
+        pass
+
+    return path
 
 
 def is_captcha_related_exception(
@@ -2418,13 +4704,152 @@ def is_captcha_related_exception(
     )
 
 
+def safe_page_url(
+    page: Page | None,
+) -> str:
+    """在頁面已關閉或導頁中的情況下安全取得 URL。"""
+    if page is None:
+        return ""
+
+    try:
+        return str(page.url)
+    except Exception:
+        return ""
+
+
+def page_is_open(
+    page: Page | None,
+) -> bool:
+    """判斷 Playwright Page 是否仍可使用。"""
+    if page is None:
+        return False
+
+    try:
+        return not page.is_closed()
+    except Exception:
+        return False
+
+
+def browser_is_connected(
+    browser: Browser | None,
+) -> bool:
+    """判斷 Playwright Browser process 是否仍連線。"""
+    if browser is None:
+        return False
+
+    try:
+        return bool(browser.is_connected())
+    except Exception:
+        return False
+
+
+def is_browser_session_closed_exception(
+    exception: BaseException,
+) -> bool:
+    """
+    判斷 Page／BrowserContext／Browser 是否已關閉。
+
+    這類錯誤不能在原本的 page 上重試，必須先重建瀏覽器工作階段。
+    """
+    message = normalize_text(
+        f"{type(exception).__name__}: {exception}"
+    ).lower()
+
+    closed_patterns = (
+        "targetclosederror",
+        "target page, context or browser has been closed",
+        "page has been closed",
+        "browser has been closed",
+        "context has been closed",
+        "browser disconnected",
+        "browser.new_context: target page, context or browser has been closed",
+    )
+
+    return any(
+        pattern in message
+        for pattern in closed_patterns
+    )
+
+
+def click_effect_observed(
+    page: Page,
+    locator: Locator,
+    before_url: str,
+    before_text: str,
+) -> bool:
+    """
+    確認點擊是否其實已經成功。
+
+    Playwright 可能只是在「等待導頁完成」時逾時；只要 URL、DOM、
+    結果標記或控制項附著狀態已改變，就視為點擊已成功觸發。
+    """
+    if not page_is_open(page):
+        return False
+
+    current_url = safe_page_url(page)
+
+    if current_url and current_url != before_url:
+        return True
+
+    try:
+        if locator.count() <= 0:
+            return True
+    except PlaywrightError:
+        # navigation 造成 execution context／locator 失效時，通常表示點擊
+        # 已觸發；但頁面若已真正關閉，前面已先返回 False。
+        return page_is_open(page)
+
+    if before_text:
+        current_text = body_text(page)
+        if current_text and current_text != before_text:
+            return True
+
+    return False
+
+
+def wait_for_click_effect(
+    page: Page,
+    locator: Locator,
+    before_url: str,
+    before_text: str,
+    timeout_ms: int,
+) -> bool:
+    """短暫等待 URL 或 DOM 改變，避免把成功導頁誤判成 click 失敗。"""
+    deadline = time.monotonic() + max(
+        250,
+        min(timeout_ms, 5000),
+    ) / 1000.0
+
+    while time.monotonic() < deadline:
+        if click_effect_observed(
+            page,
+            locator,
+            before_url,
+            before_text,
+        ):
+            return True
+        time.sleep(0.10)
+
+    return click_effect_observed(
+        page,
+        locator,
+        before_url,
+        before_text,
+    )
+
+
 def is_transient_page_exception(
     exception: BaseException,
 ) -> bool:
-    """判斷是否為導頁、執行環境切換或暫時性瀏覽器錯誤。"""
+    """判斷是否為可重新查詢的暫時性頁面錯誤。"""
     if isinstance(
         exception,
         TransientPageError,
+    ):
+        return True
+
+    if is_browser_session_closed_exception(
+        exception
     ):
         return True
 
@@ -2438,7 +4863,6 @@ def is_transient_page_exception(
         "most likely because of a navigation",
         "navigation interrupted",
         "frame was detached",
-        "target page, context or browser has been closed",
         "page.goto: timeout",
         "net::err_",
     )
@@ -2593,6 +5017,8 @@ def page_has_result_marker(page: Page) -> bool:
         f"xpath={CURRENT_RESULT_CONTAINER_XPATH}",
         f"xpath={CURRENT_RESULT_TABLE_XPATH}",
         f"xpath={CURRENT_RESULT_SECOND_TAB_XPATH}",
+        f"xpath={CURRENT_PAGINATION_BANNER_XPATH}",
+        f"xpath={PAID_PAGINATION_BANNER_XPATH}",
     )
 
     for selector in selectors:
@@ -3456,18 +5882,7 @@ def first_present_value(
 def build_paid_table_from_json_payload(
     payload: Any,
 ) -> ExtractedTable | None:
-    """
-    將 hidden input 的 JSON 轉成來源 155598 的 A:G 結構。
-
-    JSON 欄位對應：
-    - A：空白
-    - B：繳費日期（updateTime）
-    - C：單號（vilTicket）
-    - D：車號（plateNo）
-    - E：事由（vilFact）
-    - F：繳納方式（payWay）
-    - G：罰鍰（payment，依序備援 penalty、penaltyAmount）
-    """
+    """將目前頁面的 hidden JSON 轉成來源 155598 的 A:G 結構。"""
     records: Any = payload
 
     if isinstance(records, dict):
@@ -3488,12 +5903,10 @@ def build_paid_table_from_json_payload(
         return None
 
     canonical_rows: list[list[Any]] = []
+    row_keys: list[str] = []
 
     for raw_record in records:
-        if not isinstance(
-            raw_record,
-            dict,
-        ):
+        if not isinstance(raw_record, dict):
             continue
 
         payment_date_value = first_present_value(
@@ -3518,7 +5931,6 @@ def build_paid_table_from_json_payload(
                 ),
             )
         )
-
         plate_number = normalize_text(
             first_present_value(
                 raw_record,
@@ -3529,7 +5941,6 @@ def build_paid_table_from_json_payload(
                 ),
             )
         )
-
         reason = normalize_text(
             first_present_value(
                 raw_record,
@@ -3540,7 +5951,6 @@ def build_paid_table_from_json_payload(
                 ),
             )
         )
-
         payment_method = normalize_text(
             first_present_value(
                 raw_record,
@@ -3551,7 +5961,6 @@ def build_paid_table_from_json_payload(
                 ),
             )
         )
-
         fine = normalize_amount(
             first_present_value(
                 raw_record,
@@ -3575,17 +5984,29 @@ def build_paid_table_from_json_payload(
         payment_date = format_roc_date(
             payment_date_value
         )
+        canonical = [
+            None,
+            payment_date or None,
+            ticket_number,
+            plate_number,
+            reason,
+            payment_method or None,
+            fine,
+        ]
+        canonical_rows.append(canonical)
 
-        canonical_rows.append(
-            [
-                None,
-                payment_date or None,
-                ticket_number,
-                plate_number,
-                reason,
-                payment_method or None,
-                fine,
-            ]
+        # 單號是已繳紀錄的主要識別欄位；仍將其他欄位納入，避免網站重用單號時誤判。
+        row_keys.append(
+            record_fingerprint(
+                [
+                    ticket_number,
+                    plate_number,
+                    payment_date,
+                    reason,
+                    payment_method,
+                    fine,
+                ]
+            )
         )
 
     if not canonical_rows:
@@ -3604,8 +6025,8 @@ def build_paid_table_from_json_payload(
             "罰鍰",
         ],
         rows=canonical_rows,
+        row_keys=row_keys,
     )
-
 
 def extract_paid_table_from_hidden_json(
     page: Page,
@@ -3790,14 +6211,35 @@ def extract_visible_tables(
               )
               && visible(cell)
             ))
-            .map(cell => ({
-              text: norm(
-                cell.innerText
-              ),
-              header: (
-                cell.tagName === 'TH'
-              )
-            }));
+            .map(cell => {
+              const controls = [
+                ...cell.querySelectorAll(
+                  'input, a, button, select, option'
+                )
+              ].map(control => [
+                control.tagName || '',
+                control.getAttribute('type') || '',
+                control.getAttribute('name') || '',
+                control.id || '',
+                control.getAttribute('value') || '',
+                control.getAttribute('href') || '',
+                control.getAttribute('onclick') || '',
+                control.getAttribute('data-id') || '',
+                control.getAttribute('data-key') || ''
+              ].join('|'));
+
+              return {
+                text: norm(cell.innerText),
+                identity: norm([
+                  cell.innerText || '',
+                  cell.getAttribute('id') || '',
+                  cell.getAttribute('data-id') || '',
+                  cell.getAttribute('data-key') || '',
+                  ...controls
+                ].join(' || ')),
+                header: cell.tagName === 'TH'
+              };
+            });
 
           const previousTitle = table => {
             if (
@@ -3921,10 +6363,11 @@ def extract_visible_tables(
         canonical_rows: list[
             list[Any]
         ] = []
+        canonical_keys: list[str] = []
 
-        for row in plain_rows[
-            header_row + 1:
-        ]:
+        for row_offset, row in enumerate(
+            plain_rows[header_row + 1:]
+        ):
             if kind == TABLE_KIND_PAID:
                 canonical = (
                     canonicalize_paid_row(
@@ -3943,6 +6386,20 @@ def extract_visible_tables(
             if canonical is not None:
                 canonical_rows.append(
                     canonical
+                )
+                raw_identity_row = [
+                    normalize_text(
+                        cell.get("identity")
+                        or cell.get("text")
+                    )
+                    for cell in raw_rows[
+                        header_row + 1 + row_offset
+                    ]
+                ]
+                canonical_keys.append(
+                    record_fingerprint(
+                        raw_identity_row
+                    )
                 )
 
         if not canonical_rows:
@@ -3982,6 +6439,7 @@ def extract_visible_tables(
                 ),
                 headers=headers,
                 rows=canonical_rows,
+                row_keys=canonical_keys,
             )
         )
 
@@ -4162,130 +6620,64 @@ def find_next_page_control(
     return None
 
 
+def extract_paid_page_tables(
+    page: Page,
+    timeout_ms: int,
+) -> list[ExtractedTable]:
+    """
+    擷取第二階段目前頁面的資料。
+
+    優先使用畫面上目前頁的表格，因為 hidden JSON 不保證包含全部頁，
+    也不保證能正確反映目前頁碼。只有畫面表格無法解析時，才使用
+    hidden JSON 作為同一頁的備援。
+    """
+    visible_tables = extract_visible_tables_with_retry(
+        page,
+        timeout_ms,
+    )
+    paid_visible = [
+        table
+        for table in visible_tables
+        if table.kind == TABLE_KIND_PAID
+    ]
+
+    if paid_visible:
+        return paid_visible
+
+    json_input_found, paid_json_table = (
+        extract_paid_table_from_hidden_json(page)
+    )
+
+    if json_input_found and paid_json_table is not None:
+        return [paid_json_table]
+
+    return []
+
+
 def collect_all_result_pages(
     page: Page,
     timeout_ms: int,
-    max_pages: int = 100,
-) -> list[ExtractedTable]:
+    max_pages: int = 1000,
+) -> tuple[list[ExtractedTable], list[PageAudit]]:
     """
-    收集結果資料。
+    逐頁收集「交通違規繳納記錄查詢」。
 
-    hidden JSON 已包含完整繳納紀錄，因此找到 JSON 後不再點分頁；
-    這可避免在已取得完整資料後又導頁，造成 execution context destroyed。
+    不再假設 hidden JSON 是全部資料；每一頁均以 goPage/changePage
+    實際切換、擷取並驗證，最後必須符合網站 showbanner 宣告的
+    「總頁數／總筆數」，且不得有重複資料。
     """
-    all_tables: list[ExtractedTable] = []
-    seen_page_signatures: set[str] = set()
-    seen_table_signatures: set[str] = set()
-
-    for _ in range(max_pages):
-        try:
-            (
-                json_input_found,
-                paid_json_table,
-            ) = extract_paid_table_from_hidden_json(
-                page
-            )
-        except Exception as exc:
-            if is_transient_page_exception(exc):
-                raise TransientPageError(
-                    "讀取結果 JSON 時頁面仍在導向："
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            raise
-
-        page_tables = extract_visible_tables_with_retry(
+    return capture_paginated_group(
+        page=page,
+        banner_xpath=PAID_PAGINATION_BANNER_XPATH,
+        section=QUERY_SECTION_PAID,
+        category=PAID_RECORD_CATEGORY,
+        extractor=lambda: extract_paid_page_tables(
             page,
             timeout_ms,
-        )
-
-        if json_input_found:
-            page_tables = [
-                table
-                for table in page_tables
-                if table.kind != TABLE_KIND_PAID
-            ]
-
-            if paid_json_table is not None:
-                page_tables.append(
-                    paid_json_table
-                )
-
-        page_signature = hashlib.sha256(
-            json.dumps(
-                [
-                    {
-                        "kind": table.kind,
-                        "title": table.title,
-                        "headers": table.headers,
-                        "rows": table.rows,
-                    }
-                    for table in page_tables
-                ],
-                ensure_ascii=False,
-                sort_keys=True,
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
-
-        if page_signature in seen_page_signatures:
-            break
-
-        seen_page_signatures.add(
-            page_signature
-        )
-
-        for table in page_tables:
-            signature = hashlib.sha256(
-                json.dumps(
-                    [
-                        table.kind,
-                        table.title,
-                        table.headers,
-                        table.rows,
-                    ],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-
-            if signature in seen_table_signatures:
-                continue
-
-            seen_table_signatures.add(
-                signature
-            )
-            all_tables.append(table)
-
-        # hidden JSON 是完整紀錄，不需要再操作 pagination。
-        if json_input_found:
-            break
-
-        next_control = find_next_page_control(page)
-
-        if next_control is None:
-            break
-
-        before = body_text(page)
-
-        try:
-            next_control.click(
-                timeout=5000
-            )
-            wait_for_result_change(
-                page,
-                before,
-                timeout_ms,
-            )
-        except PlaywrightError as exc:
-            if is_transient_page_exception(exc):
-                raise TransientPageError(
-                    "結果分頁導向尚未完成："
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-            break
-
-    return all_tables
+        ),
+        timeout_ms=timeout_ms,
+        max_pages=max_pages,
+    )
 
 def save_debug_artifacts(
     page: Page,
@@ -4360,8 +6752,8 @@ def save_captcha_image(
     優先使用指定 XPath 擷取目前瀏覽器中的 CAPTCHA 圖片。
 
     回傳的 PNG/JPG 路徑會交給
-    call_english_alphanumeric_image_input()，
-    再由該函式呼叫 imageInput(image)。
+    call_english_alphanumeric_ocr()，
+    再由該函式呼叫 ocrImage(image)。
     """
     normalized_format = (
         normalize_captcha_image_format(
@@ -4459,22 +6851,18 @@ def validate_captcha_code(value: Any) -> str:
 
     return code
 
-def call_english_alphanumeric_image_input(
+def call_english_alphanumeric_ocr(
     captcha_image_path: Path,
 ) -> str:
     """
     將 CAPTCHA 圖片載入為 PIL.Image.Image，直接呼叫：
 
-        imageInput(image)
+        ocrImage(image)
 
-    englishAlphanumeric.py 內的 imageInput() 應負責：
-    1. 顯示外部人工輸入 UI。
-    2. 顯示傳入的驗證碼圖片。
-    3. 等待使用者輸入並送出。
-    4. 關閉 UI。
-    5. 回傳四個英數字元字串。
+    englishAlphanumericOcrApi.py 內的 ocrImage() 應接收
+    PIL.Image.Image 並回傳四個英數字元字串。
 
-    本函式接收 imageInput() 的回傳值，驗證格式後再回傳給
+    本函式接收 ocrImage() 的回傳值，驗證格式後再回傳給
     acquire_captcha()。
     """
     resolved_image_path = (
@@ -4485,19 +6873,19 @@ def call_english_alphanumeric_image_input(
 
     if not resolved_image_path.exists():
         raise RuntimeError(
-            "要傳給 imageInput() 的圖片不存在："
+            "要傳給 ocrImage() 的圖片不存在："
             f"{resolved_image_path}"
         )
 
     if not callable(ocrImage):
         raise RuntimeError(
-            "從 englishAlphanumeric 匯入的 imageInput 不是可呼叫函式"
+            "從 englishAlphanumericOcrApi 匯入的 ocrImage 不是可呼叫函式"
         )
 
     ui_image: Image.Image | None = None
 
     print(
-        "  呼叫 imageInput(image)",
+        "  呼叫 ocrImage(image)",
         flush=True,
     )
     print(
@@ -4510,7 +6898,7 @@ def call_english_alphanumeric_image_input(
             opened_image.load()
 
             # copy() 後，即使 Image.open() 的檔案已關閉，
-            # imageInput() 仍可正常使用圖片。
+            # ocrImage() 仍可正常使用圖片。
             ui_image = opened_image.copy()
 
         returned_code = ocrImage(
@@ -4519,7 +6907,7 @@ def call_english_alphanumeric_image_input(
 
     except Exception as exc:
         raise RuntimeError(
-            "imageInput() 執行失敗："
+            "ocrImage() 執行失敗："
             f"{type(exc).__name__}: {exc}"
         ) from exc
 
@@ -4535,7 +6923,7 @@ def call_english_alphanumeric_image_input(
     )
 
     print(
-        "  imageInput() 已回傳四個英數字元，"
+        "  ocrImage() 已回傳四個英數字元，"
         "準備自動填入網頁驗證碼欄位。",
         flush=True,
     )
@@ -4556,8 +6944,8 @@ def acquire_captcha(
     2. 依 XPath 擷取目前 CAPTCHA 所在的 td 區塊。
     3. 保存成 PNG/JPG。
     4. 將圖片開啟成 PIL.Image.Image。
-    5. 呼叫 imageInput(image)。
-    6. 接收 imageInput() 回傳的四碼字串。
+    5. 呼叫 ocrImage(image)。
+    6. 接收 ocrImage() 回傳的四碼字串。
     7. 將字串回傳給 perform_query() 自動填入網頁。
     """
     captcha_input = locate_captcha_input(page)
@@ -4587,7 +6975,7 @@ def acquire_captcha(
         flush=True,
     )
 
-    return call_english_alphanumeric_image_input(
+    return call_english_alphanumeric_ocr(
         captcha_image_path=captcha_path,
     )
 
@@ -4678,7 +7066,23 @@ def click_locator_with_fallback(
     timeout_ms: int,
     label: str,
 ) -> str:
-    """使用一般、強制與 JavaScript 三層方式點擊指定控制項。"""
+    """
+    點擊控制項，但不讓 Playwright 自動等待導頁拖垮整個流程。
+
+    修正重點：
+    1. 使用 no_wait_after=True，點擊後由呼叫端自行等待結果頁。
+    2. 即使 click() 丟出 TimeoutError，也先檢查 URL／DOM 是否已改變。
+    3. 已成功觸發導頁時不會再點第二次舊 locator。
+    4. JavaScript 備援使用 setTimeout(element.click, 0)，讓 evaluate 在
+       導頁發生前先返回，避免 execution context destroyed。
+    """
+    if not page_is_open(page):
+        raise RuntimeError(
+            f"{label}無法點擊：目前 Page 已關閉"
+        )
+
+    before_url = safe_page_url(page)
+    before_text = body_text(page)
     errors: list[str] = []
 
     try:
@@ -4690,32 +7094,36 @@ def click_locator_with_fallback(
 
     try:
         locator.click(
-            timeout=min(timeout_ms, 10000)
-        )
-        return f"{label}一般點擊"
-    except PlaywrightError as exc:
-        errors.append(f"一般點擊：{exc}")
-
-    try:
-        locator.click(
             timeout=min(timeout_ms, 10000),
-            force=True,
+            no_wait_after=True,
         )
-        return f"{label}強制點擊"
-    except PlaywrightError as exc:
-        errors.append(f"強制點擊：{exc}")
-
-    try:
-        locator.evaluate(
-            "element => element.click()"
-        )
-        return f"{label}JavaScript 點擊"
-    except Exception as exc:
+        return f"{label}一般點擊（不等待導頁）"
+    except (TypeError, PlaywrightError) as exc:
         errors.append(
-            "定位器 JavaScript 點擊："
-            f"{type(exc).__name__}: {exc}"
+            f"一般點擊：{type(exc).__name__}: {exc}"
         )
 
+        if wait_for_click_effect(
+            page,
+            locator,
+            before_url,
+            before_text,
+            min(timeout_ms, 3000),
+        ):
+            return (
+                f"{label}一般點擊已觸發；"
+                "僅 Playwright 等待導頁逾時"
+            )
+
+    if is_browser_session_closed_exception(
+        RuntimeError(" | ".join(errors))
+    ) or not page_is_open(page):
+        raise RuntimeError(
+            f"{label}點擊後瀏覽器工作階段已關閉；"
+            f"錯誤：{' | '.join(errors)}"
+        )
+
+    # 先用非同步 JavaScript 觸發，確保 evaluate 能在導頁前返回。
     try:
         clicked = page.evaluate(
             """
@@ -4732,7 +7140,7 @@ def click_locator_with_fallback(
                 return false;
               }
 
-              element.click();
+              window.setTimeout(() => element.click(), 0);
               return true;
             }
             """,
@@ -4740,16 +7148,72 @@ def click_locator_with_fallback(
         )
 
         if clicked:
-            return f"{label}document.evaluate() 點擊"
+            return f"{label}非同步 JavaScript 點擊"
     except PlaywrightError as exc:
-        errors.append(f"document.evaluate()：{exc}")
+        errors.append(
+            "非同步 JavaScript 點擊："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        if wait_for_click_effect(
+            page,
+            locator,
+            before_url,
+            before_text,
+            min(timeout_ms, 3000),
+        ):
+            return (
+                f"{label}JavaScript 點擊已觸發；"
+                "導頁造成 execution context 切換"
+            )
+
+    if not page_is_open(page):
+        raise RuntimeError(
+            f"{label}點擊期間 Page 已關閉；"
+            f"錯誤：{' | '.join(errors)}"
+        )
+
+    try:
+        # 重新依 XPath 取得新 locator，避免沿用導頁前的舊 locator。
+        fresh_locator = page.locator(
+            f"xpath={exact_xpath}"
+        ).first
+        fresh_locator.click(
+            timeout=min(timeout_ms, 10000),
+            force=True,
+            no_wait_after=True,
+        )
+        return f"{label}強制點擊（不等待導頁）"
+    except (TypeError, PlaywrightError) as exc:
+        errors.append(
+            f"強制點擊：{type(exc).__name__}: {exc}"
+        )
+
+        try:
+            fresh_locator = page.locator(
+                f"xpath={exact_xpath}"
+            ).first
+        except Exception:
+            fresh_locator = locator
+
+        if wait_for_click_effect(
+            page,
+            fresh_locator,
+            before_url,
+            before_text,
+            min(timeout_ms, 3000),
+        ):
+            return (
+                f"{label}強制點擊已觸發；"
+                "僅等待導頁逾時"
+            )
 
     raise RuntimeError(
         f"{label}已定位，但所有點擊方式均失敗；"
         f"XPath：{exact_xpath}；"
+        f"目前 URL：{safe_page_url(page)}；"
         f"錯誤：{' | '.join(errors)}"
     )
-
 
 def locate_current_query_corporate_tab(
     page: Page,
@@ -4836,8 +7300,8 @@ def open_current_query_corporate_form(
     """
     開啟「交通違規（含強制險）查詢及繳納」法人表單。
 
-    第一個網址依使用者指定使用原本 legal 入口；若頁面沒有法人頁籤，
-    再改用監理服務網正式 penaltyQueryPay 路徑。
+    Browser／Context／Page 已關閉時立即向上拋出，交由 main 重建工作
+    階段；不可繼續在同一個死亡 page 上輪流嘗試兩個 URL。
     """
     urls: list[str] = []
 
@@ -4852,6 +7316,11 @@ def open_current_query_corporate_form(
 
     for candidate_url in urls:
         try:
+            if not page_is_open(page):
+                raise RuntimeError(
+                    "Target page, context or browser has been closed"
+                )
+
             page.goto(
                 candidate_url,
                 wait_until="domcontentloaded",
@@ -4866,7 +7335,6 @@ def open_current_query_corporate_form(
             except PlaywrightTimeoutError:
                 pass
 
-            # 若已經是法人表單，不必重複點頁籤。
             try:
                 locate_current_query_button(page)
                 locate_company_id_input(page)
@@ -4905,6 +7373,9 @@ def open_current_query_corporate_form(
             return
 
         except Exception as exc:
+            if is_browser_session_closed_exception(exc):
+                raise
+
             errors.append(
                 f"{candidate_url}："
                 f"{type(exc).__name__}: {exc}"
@@ -4914,7 +7385,6 @@ def open_current_query_corporate_form(
         "無法開啟交通違規（含強制險）法人查詢表單；"
         + " | ".join(errors)
     )
-
 
 def click_current_query_button(
     page: Page,
@@ -4933,7 +7403,7 @@ def click_current_query_button(
 def table_rows_from_locator(
     table_locator: Locator,
 ) -> list[list[dict[str, Any]]]:
-    """只讀取目標 table 的直屬列與儲存格，避免抓到外層導覽表格。"""
+    """讀取目標 table 的直屬列，並保留控制項屬性供唯一鍵使用。"""
     return table_locator.evaluate(
         """
         table => {
@@ -4957,15 +7427,39 @@ def table_rows_from_locator(
               cell.tagName === 'TH'
               || cell.tagName === 'TD'
             ))
-            .map(cell => ({
-              text: norm(cell.innerText),
-              header: cell.tagName === 'TH'
-            })))
+            .map(cell => {
+              const controls = [
+                ...cell.querySelectorAll(
+                  'input, a, button, select, option'
+                )
+              ].map(control => [
+                control.tagName || '',
+                control.getAttribute('type') || '',
+                control.getAttribute('name') || '',
+                control.id || '',
+                control.getAttribute('value') || '',
+                control.getAttribute('href') || '',
+                control.getAttribute('onclick') || '',
+                control.getAttribute('data-id') || '',
+                control.getAttribute('data-key') || ''
+              ].join('|'));
+
+              return {
+                text: norm(cell.innerText),
+                identity: norm([
+                  cell.innerText || '',
+                  cell.getAttribute('id') || '',
+                  cell.getAttribute('data-id') || '',
+                  cell.getAttribute('data-key') || '',
+                  ...controls
+                ].join(' || ')),
+                header: cell.tagName === 'TH'
+              };
+            }))
             .filter(row => row.length > 0);
         }
         """
     )
-
 
 def add_current_category_to_row(
     row: list[Any],
@@ -5037,13 +7531,16 @@ def extract_current_table_at_xpath(
     )
 
     canonical_rows: list[list[Any]] = []
+    canonical_keys: list[str] = []
     headers: list[str] = []
 
     if identified is not None:
         kind, header_row, columns = identified
         headers = plain_rows[header_row]
 
-        for row in plain_rows[header_row + 1:]:
+        for row_offset, row in enumerate(
+            plain_rows[header_row + 1:]
+        ):
             canonical = (
                 canonicalize_unpaid_row(
                     row,
@@ -5062,6 +7559,20 @@ def extract_current_table_at_xpath(
                     category,
                 )
             )
+            raw_identity_row = [
+                normalize_text(
+                    cell.get("identity")
+                    or cell.get("text")
+                )
+                for cell in payload[
+                    header_row + 1 + row_offset
+                ]
+            ]
+            canonical_keys.append(
+                record_fingerprint(
+                    raw_identity_row
+                )
+            )
     else:
         # 網站若只更換表頭名稱，仍保留每一列的原始文字，避免整張表遺失。
         data_start = 0
@@ -5074,7 +7585,9 @@ def extract_current_table_at_xpath(
                 data_start = index + 1
                 break
 
-        for row in plain_rows[data_start:]:
+        for row_offset, row in enumerate(
+            plain_rows[data_start:]
+        ):
             if not any(row):
                 continue
 
@@ -5099,6 +7612,20 @@ def extract_current_table_at_xpath(
             canonical_rows.append(
                 raw_values
             )
+            raw_identity_row = [
+                normalize_text(
+                    cell.get("identity")
+                    or cell.get("text")
+                )
+                for cell in payload[
+                    data_start + row_offset
+                ]
+            ]
+            canonical_keys.append(
+                record_fingerprint(
+                    raw_identity_row
+                )
+            )
 
     if not canonical_rows:
         return None
@@ -5108,6 +7635,7 @@ def extract_current_table_at_xpath(
         title=category,
         headers=headers,
         rows=canonical_rows,
+        row_keys=canonical_keys,
     )
 
 
@@ -5159,22 +7687,44 @@ def wait_for_current_table_change(
 def collect_current_violation_tables(
     page: Page,
     timeout_ms: int,
-) -> list[ExtractedTable]:
-    """依序收集可線上繳納及第二頁籤的表格。"""
-    tables: list[ExtractedTable] = []
+) -> tuple[list[ExtractedTable], list[PageAudit]]:
+    """
+    逐頁收集第一階段的兩個頁籤。
 
-    online_table = extract_current_table_at_xpath(
-        page,
-        CURRENT_ONLINE_CATEGORY,
+    先完整爬完「可線上繳納」，確認頁數、總筆數及重複資料均正確後，
+    再切換到「不可線上繳納」並執行相同驗證。
+    """
+    all_tables: list[ExtractedTable] = []
+    all_audits: list[PageAudit] = []
+
+    online_tables, online_audits = (
+        capture_paginated_group(
+            page=page,
+            banner_xpath=(
+                CURRENT_PAGINATION_BANNER_XPATH
+            ),
+            section=QUERY_SECTION_CURRENT,
+            category=CURRENT_ONLINE_CATEGORY,
+            extractor=lambda: (
+                [table]
+                if (
+                    table := extract_current_table_at_xpath(
+                        page,
+                        CURRENT_ONLINE_CATEGORY,
+                    )
+                )
+                is not None
+                else []
+            ),
+            timeout_ms=timeout_ms,
+        )
     )
-
-    if online_table is not None:
-        tables.append(online_table)
+    all_tables.extend(online_tables)
+    all_audits.extend(online_audits)
 
     before_table_text = current_result_table_text(
         page
     )
-
     second_tab = page.locator(
         f"xpath={CURRENT_RESULT_SECOND_TAB_XPATH}"
     )
@@ -5184,46 +7734,62 @@ def collect_current_violation_tables(
     except PlaywrightError:
         second_tab_exists = False
 
-    if second_tab_exists:
-        method = click_locator_with_fallback(
+    if not second_tab_exists:
+        raise DataIntegrityError(
+            "找不到『不可線上繳納』頁籤，無法完成第一階段完整性檢查",
+            {
+                "xpath": CURRENT_RESULT_SECOND_TAB_XPATH,
+                "result_url": page.url,
+            },
+        )
+
+    method = click_locator_with_fallback(
+        page=page,
+        locator=second_tab.first,
+        exact_xpath=CURRENT_RESULT_SECOND_TAB_XPATH,
+        timeout_ms=timeout_ms,
+        label="不可線上繳納頁籤",
+    )
+
+    print(
+        f"  第一階段第二頁籤點擊方式：{method}",
+        flush=True,
+    )
+
+    wait_for_current_table_change(
+        page,
+        before_table_text,
+        timeout_ms,
+    )
+
+    offline_tables, offline_audits = (
+        capture_paginated_group(
             page=page,
-            locator=second_tab.first,
-            exact_xpath=(
-                CURRENT_RESULT_SECOND_TAB_XPATH
+            banner_xpath=(
+                CURRENT_PAGINATION_BANNER_XPATH
+            ),
+            section=QUERY_SECTION_CURRENT,
+            category=CURRENT_OFFLINE_CATEGORY,
+            extractor=lambda: (
+                [table]
+                if (
+                    table := extract_current_table_at_xpath(
+                        page,
+                        CURRENT_OFFLINE_CATEGORY,
+                    )
+                )
+                is not None
+                else []
             ),
             timeout_ms=timeout_ms,
-            label="不可線上繳納頁籤",
         )
+    )
+    all_tables.extend(offline_tables)
+    all_audits.extend(offline_audits)
 
-        print(
-            f"  第一階段第二頁籤點擊方式：{method}",
-            flush=True,
-        )
+    validate_page_audits(all_audits)
 
-        changed = wait_for_current_table_change(
-            page,
-            before_table_text,
-            timeout_ms,
-        )
-
-        offline_table = extract_current_table_at_xpath(
-            page,
-            CURRENT_OFFLINE_CATEGORY,
-        )
-
-        # 若內容沒有切換，避免把第一頁籤資料重複寫入兩次。
-        if (
-            offline_table is not None
-            and (
-                changed
-                or current_result_table_text(page)
-                != before_table_text
-            )
-        ):
-            tables.append(offline_table)
-
-    return tables
-
+    return all_tables, all_audits
 
 def perform_current_violation_query(
     page: Page,
@@ -5235,7 +7801,7 @@ def perform_current_violation_query(
     captcha_dir: Path,
     captcha_image_format: str,
 ) -> QueryOutcome:
-    """第一階段：查詢尚未結案的交通違規及強制險違規。"""
+    """第一階段：逐頁查詢尚未結案的交通違規及強制險違規。"""
     last_retry_message = ""
 
     for attempt in range(
@@ -5252,10 +7818,7 @@ def perform_current_violation_query(
             company_input = locate_company_id_input(
                 page
             )
-            company_input.fill(
-                company.query_id
-            )
-
+            company_input.fill(company.query_id)
             before = body_text(page)
 
             try:
@@ -5285,12 +7848,10 @@ def perform_current_violation_query(
             locate_captcha_input(page).fill(
                 captcha_code
             )
-
             submit_method = click_current_query_button(
                 page,
                 timeout_ms,
             )
-
             print(
                 f"  第一階段查詢按鈕點擊方式：{submit_method}",
                 flush=True,
@@ -5335,95 +7896,55 @@ def perform_current_violation_query(
                     page.url,
                 )
 
-            tables = collect_current_violation_tables(
-                page,
-                timeout_ms,
+            tables, page_audits = (
+                collect_current_violation_tables(
+                    page,
+                    timeout_ms,
+                )
             )
-
+            duplicate_keys = validate_page_audits(
+                page_audits
+            )
             count = sum(
                 table.record_count
                 for table in tables
             )
-
             online_count = sum(
                 table.record_count
                 for table in tables
-                if table.title
+                if table.category
                 == CURRENT_ONLINE_CATEGORY
             )
-
             offline_count = sum(
                 table.record_count
                 for table in tables
-                if table.title
+                if table.category
                 == CURRENT_OFFLINE_CATEGORY
             )
+            summary = build_pagination_summary(
+                page_audits
+            )
 
-            if count > 0:
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    count,
-                    tables,
-                    (
-                        "交通違規（含強制險）查詢完成："
-                        f"可線上繳納 {online_count} 筆；"
-                        f"不可線上繳納 {offline_count} 筆"
-                    ),
-                    page.url,
-                )
-
-            text = body_text(page)
-
-            if contains_any(
-                text,
-                NO_DATA_PATTERNS,
-            ):
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    0,
-                    [],
-                    "交通違規（含強制險）查詢完成：0 筆",
-                    page.url,
-                )
-
-            current_result_exists = False
-            for xpath in (
-                CURRENT_RESULT_CONTAINER_XPATH,
-                CURRENT_RESULT_TABLE_XPATH,
-                CURRENT_RESULT_SECOND_TAB_XPATH,
-            ):
-                try:
-                    if page.locator(
-                        f"xpath={xpath}"
-                    ).count() > 0:
-                        current_result_exists = True
-                        break
-                except PlaywrightError:
-                    continue
-
-            if current_result_exists:
-                save_debug_artifacts(
-                    page,
-                    debug_dir,
-                    company.query_id,
-                    "current_query_zero_result",
-                )
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    0,
-                    [],
-                    (
-                        "交通違規（含強制險）查詢完成；"
-                        "結果頁無可辨識資料，依 0 筆處理"
-                    ),
-                    page.url,
-                )
-
-            last_retry_message = (
-                "第一階段結果頁尚未完整載入"
+            return QueryOutcome(
+                status=STATUS_SUCCESS,
+                record_count=count,
+                tables=tables,
+                message=(
+                    "交通違規（含強制險）查詢完成："
+                    f"可線上繳納 {online_count} 筆；"
+                    f"不可線上繳納 {offline_count} 筆；"
+                    f"{PAGINATION_VERIFIED_MARKER}；"
+                    f"{summary}"
+                ),
+                result_url=page.url,
+                page_audits=page_audits,
+                duplicate_keys=duplicate_keys,
             )
 
         except Exception as exc:
+            if is_browser_session_closed_exception(exc):
+                raise
+
             if (
                 is_captcha_related_exception(exc)
                 or is_transient_page_exception(exc)
@@ -5433,6 +7954,9 @@ def perform_current_violation_query(
                     f"{type(exc).__name__}: {exc}"
                 )
                 continue
+
+            # DataIntegrityError 必須交給 main 立即重爬同一家公司，
+            # 不可在此吞掉後處理下一家公司。
             raise
 
     return QueryOutcome(
@@ -5450,32 +7974,38 @@ def perform_current_violation_query(
         retry_later=True,
     )
 
-
 def combine_query_outcomes(
     current_outcome: QueryOutcome,
     paid_outcome: QueryOutcome,
 ) -> QueryOutcome:
-    """將第一階段未結案違規與第二階段繳費紀錄合併。"""
+    """合併兩階段結果，並再次驗證所有分頁與總筆數。"""
     completed_statuses = {
         STATUS_SUCCESS,
         STATUS_NO_DATA,
     }
+    combined_audits = (
+        list(current_outcome.page_audits)
+        + list(paid_outcome.page_audits)
+    )
 
     if (
         current_outcome.status == STATUS_ERROR
         or paid_outcome.status == STATUS_ERROR
     ):
         return QueryOutcome(
-            STATUS_ERROR,
-            0,
-            [],
-            (
+            status=STATUS_ERROR,
+            record_count=0,
+            tables=[],
+            message=(
                 "雙階段查詢失敗；"
                 f"第一階段：{current_outcome.message}；"
                 f"第二階段：{paid_outcome.message}"
             ),
-            current_outcome.result_url
-            or paid_outcome.result_url,
+            result_url=(
+                current_outcome.result_url
+                or paid_outcome.result_url
+            ),
+            page_audits=combined_audits,
         )
 
     if (
@@ -5483,43 +8013,86 @@ def combine_query_outcomes(
         or paid_outcome.status not in completed_statuses
     ):
         return QueryOutcome(
-            STATUS_RETRY,
-            0,
-            [],
-            (
+            status=STATUS_RETRY,
+            record_count=0,
+            tables=[],
+            message=(
                 "雙階段查詢尚未全部完成；"
                 f"第一階段：{current_outcome.message}；"
                 f"第二階段：{paid_outcome.message}"
             ),
-            current_outcome.result_url
-            or paid_outcome.result_url,
+            result_url=(
+                current_outcome.result_url
+                or paid_outcome.result_url
+            ),
             retry_later=True,
+            page_audits=combined_audits,
         )
 
+    duplicate_keys = validate_page_audits(
+        combined_audits
+    )
     tables = (
         list(current_outcome.tables)
         + list(paid_outcome.tables)
     )
-
     total_count = (
         current_outcome.record_count
         + paid_outcome.record_count
     )
+    declared_total = sum(
+        int(
+            page_audit_group_stats(items)[
+                "declared_total_records"
+            ]
+        )
+        for items in group_page_audits(
+            combined_audits
+        ).values()
+    )
+
+    if total_count != declared_total:
+        raise DataIntegrityError(
+            "雙階段合計筆數與三組網站宣告總筆數不一致",
+            {
+                "first_stage_count": (
+                    current_outcome.record_count
+                ),
+                "second_stage_count": (
+                    paid_outcome.record_count
+                ),
+                "combined_count": total_count,
+                "declared_total": declared_total,
+                "page_audits": [
+                    asdict(item)
+                    for item in combined_audits
+                ],
+            },
+        )
+
+    summary = build_pagination_summary(
+        combined_audits
+    )
 
     return QueryOutcome(
-        STATUS_SUCCESS,
-        total_count,
-        tables,
-        (
+        status=STATUS_SUCCESS,
+        record_count=total_count,
+        tables=tables,
+        message=(
             f"{COMBINED_QUERY_MESSAGE_MARKER}；"
             f"第一階段 {current_outcome.record_count} 筆；"
             f"第二階段 {paid_outcome.record_count} 筆；"
-            f"合計 {total_count} 筆"
+            f"合計 {total_count} 筆；"
+            f"{PAGINATION_VERIFIED_MARKER}；"
+            f"{summary}"
         ),
-        current_outcome.result_url
-        or paid_outcome.result_url,
+        result_url=(
+            current_outcome.result_url
+            or paid_outcome.result_url
+        ),
+        page_audits=combined_audits,
+        duplicate_keys=duplicate_keys,
     )
-
 
 def perform_paid_record_query(
     page: Page,
@@ -5532,13 +8105,7 @@ def perform_paid_record_query(
     captcha_image_format: str,
     headless: bool,
 ) -> QueryOutcome:
-    """
-    查詢單一公司。
-
-    OCR 格式不符、網站回報 CAPTCHA 錯誤、導頁 context 切換及暫時空白頁
-    都在單筆的嘗試迴圈內重新查詢；只有真正不可恢復的欄位／資料錯誤
-    才回傳 STATUS_ERROR。
-    """
+    """第二階段：逐頁查詢法人交通違規繳納記錄。"""
     last_retry_message = ""
 
     for attempt in range(
@@ -5555,10 +8122,7 @@ def perform_paid_record_query(
             try:
                 page.wait_for_load_state(
                     "networkidle",
-                    timeout=min(
-                        timeout_ms,
-                        15000,
-                    ),
+                    timeout=min(timeout_ms, 15000),
                 )
             except PlaywrightTimeoutError:
                 pass
@@ -5571,11 +8135,7 @@ def perform_paid_record_query(
                     headless,
                 )
             )
-
-            company_input.fill(
-                company.query_id
-            )
-
+            company_input.fill(company.query_id)
             before = body_text(page)
 
             try:
@@ -5592,10 +8152,9 @@ def perform_paid_record_query(
                     raise
 
                 last_retry_message = (
-                    f"CAPTCHA 辨識未取得四碼："
+                    "CAPTCHA 辨識未取得四碼："
                     f"{type(exc).__name__}: {exc}"
                 )
-
                 print(
                     "  CAPTCHA OCR 結果不符合四碼格式，"
                     "將換一張並重新查詢"
@@ -5604,18 +8163,13 @@ def perform_paid_record_query(
                 )
                 continue
 
-            captcha_input = locate_captcha_input(
-                page
-            )
-            captcha_input.fill(
+            locate_captcha_input(page).fill(
                 captcha_code
             )
-
             submit_method = click_query_button(
                 page=page,
                 timeout_ms=timeout_ms,
             )
-
             print(
                 f"  查詢按鈕點擊方式：{submit_method}",
                 flush=True,
@@ -5634,7 +8188,6 @@ def perform_paid_record_query(
                 last_retry_message = (
                     "網站回報驗證碼輸入錯誤"
                 )
-
                 print(
                     "  網站回報驗證碼錯誤，"
                     "將重新取得圖片並再次辨識"
@@ -5657,11 +8210,6 @@ def perform_paid_record_query(
                     last_retry_message = (
                         f"網站暫時性回應：{message}"
                     )
-                    print(
-                        f"  {message}，將重新查詢"
-                        f"（{attempt}/{max_captcha_attempts}）。",
-                        flush=True,
-                    )
                     continue
 
                 save_debug_artifacts(
@@ -5670,7 +8218,6 @@ def perform_paid_record_query(
                     company.query_id,
                     "form_error",
                 )
-
                 return QueryOutcome(
                     STATUS_ERROR,
                     0,
@@ -5680,11 +8227,16 @@ def perform_paid_record_query(
                 )
 
             try:
-                tables = collect_all_result_pages(
-                    page,
-                    timeout_ms=timeout_ms,
+                tables, page_audits = (
+                    collect_all_result_pages(
+                        page,
+                        timeout_ms=timeout_ms,
+                    )
                 )
             except Exception as exc:
+                if is_browser_session_closed_exception(exc):
+                    raise
+
                 if not is_transient_page_exception(exc):
                     raise
 
@@ -5692,16 +8244,8 @@ def perform_paid_record_query(
                     "結果頁導向尚未完成："
                     f"{type(exc).__name__}: {exc}"
                 )
-
-                print(
-                    "  結果頁仍在導向，將整筆重新查詢"
-                    f"（{attempt}/{max_captcha_attempts}）。",
-                    flush=True,
-                )
                 continue
 
-            # 表格解析後重新讀取頁面文字。舊版使用解析前的舊 text，
-            # 因此後來才顯示的 CAPTCHA 錯誤或無資料訊息會被漏掉。
             text = body_text(page)
 
             if contains_any(
@@ -5711,123 +8255,37 @@ def perform_paid_record_query(
                 last_retry_message = (
                     "網站回報驗證碼輸入錯誤"
                 )
-                print(
-                    "  結果解析時確認為驗證碼錯誤，"
-                    "將重新查詢"
-                    f"（{attempt}/{max_captcha_attempts}）。",
-                    flush=True,
-                )
                 continue
 
+            duplicate_keys = validate_page_audits(
+                page_audits
+            )
             count = sum(
                 table.record_count
                 for table in tables
             )
-
-            if count > 0:
-                unpaid_count = sum(
-                    table.record_count
-                    for table in tables
-                    if table.kind
-                    == TABLE_KIND_UNPAID
-                )
-
-                paid_count = sum(
-                    table.record_count
-                    for table in tables
-                    if table.kind
-                    == TABLE_KIND_PAID
-                )
-
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    count,
-                    tables,
-                    (
-                        f"未繳／需到案 {unpaid_count} 筆；"
-                        f"繳納紀錄 {paid_count} 筆；"
-                        f"合計 {count} 筆"
-                    ),
-                    page.url,
-                )
-
-            # 精確 XPath 出現時，網站已正常完成查詢，只是沒有已繳資料。
-            # 依需求：交通違規筆數寫 0，違規查詢狀態寫「成功」。
-            no_paid_message = (
-                read_no_paid_data_message(
-                    page
-                )
-            )
-
-            if no_paid_message:
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    0,
-                    [],
-                    no_paid_message,
-                    page.url,
-                )
-
-            if contains_any(
-                text,
-                NO_DATA_PATTERNS,
-            ):
-                return QueryOutcome(
-                    STATUS_SUCCESS,
-                    0,
-                    [],
-                    "查詢成功，交通違規筆數為 0",
-                    page.url,
-                )
-
-            # 若仍停在 CAPTCHA 表單或頁面尚未完整載入，不可誤判為 0 筆；
-            # 應重新取得 CAPTCHA 並重做這筆查詢。
-            if page_has_query_form(page):
-                last_retry_message = (
-                    "查詢送出後仍停留在 CAPTCHA 查詢頁，"
-                    "可能是驗證碼訊息尚未完成顯示"
-                )
-                print(
-                    "  查詢後仍停留在驗證碼頁面，"
-                    "將重新查詢"
-                    f"（{attempt}/{max_captcha_attempts}）。",
-                    flush=True,
-                )
-                continue
-
-            if not page_has_result_marker(page):
-                last_retry_message = (
-                    "結果頁尚未完整載入或只取得暫時空白頁"
-                )
-                print(
-                    "  結果頁尚未完整載入，將重新查詢"
-                    f"（{attempt}/{max_captcha_attempts}）。",
-                    flush=True,
-                )
-                continue
-
-            # 依需求：如果結果頁已完整載入，但找不到可辨識的違規明細
-            # 表格，仍視為查詢成功且筆數為 0。保留除錯檔供日後確認網站
-            # 結構是否改版，但不再把主表狀態標成「錯誤」。
-            save_debug_artifacts(
-                page,
-                debug_dir,
-                company.query_id,
-                "unrecognized_zero_result",
+            summary = build_pagination_summary(
+                page_audits
             )
 
             return QueryOutcome(
-                STATUS_SUCCESS,
-                0,
-                [],
-                (
-                    "查詢成功；找不到可辨識的違規明細表格，"
-                    "依 0 筆處理；已保存除錯 HTML/截圖"
+                status=STATUS_SUCCESS,
+                record_count=count,
+                tables=tables,
+                message=(
+                    f"繳納紀錄 {count} 筆；"
+                    f"{PAGINATION_VERIFIED_MARKER}；"
+                    f"{summary}"
                 ),
-                page.url,
+                result_url=page.url,
+                page_audits=page_audits,
+                duplicate_keys=duplicate_keys,
             )
 
         except Exception as exc:
+            if is_browser_session_closed_exception(exc):
+                raise
+
             if (
                 is_captcha_related_exception(exc)
                 or is_transient_page_exception(exc)
@@ -5842,6 +8300,7 @@ def perform_paid_record_query(
                     flush=True,
                 )
                 continue
+
             raise
 
     return QueryOutcome(
@@ -5866,22 +8325,21 @@ def should_skip_row(
     tracking_columns: dict[str, int],
     resume: bool,
 ) -> bool:
+    """
+    只有新版分頁稽核已通過的資料才能續跑略過。
+
+    舊版雖然顯示「成功」，但沒有逐頁驗證與 showbanner 總筆數，
+    因此一律重新查詢，避免像 45893188 只留下 23 筆。
+    """
     if not resume:
         return False
 
     status = normalize_text(
         worksheet.cell(
             company.excel_row,
-            tracking_columns[
-                "違規查詢狀態"
-            ],
+            tracking_columns["違規查詢狀態"],
         ).value
     )
-
-    # 舊版的「無資料」也屬於已完成的零筆查詢；新版不再產生此狀態，
-    # 但仍保留續跑相容性。
-    if status == STATUS_NO_DATA:
-        return True
 
     if status != STATUS_SUCCESS:
         return False
@@ -5889,38 +8347,61 @@ def should_skip_row(
     query_message = normalize_text(
         worksheet.cell(
             company.excel_row,
-            tracking_columns[
-                "違規查詢訊息"
-            ],
+            tracking_columns["違規查詢訊息"],
+        ).value
+    )
+    integrity_value = normalize_text(
+        worksheet.cell(
+            company.excel_row,
+            tracking_columns["分頁完整性檢查"],
+        ).value
+    )
+    duplicate_value = normalize_text(
+        worksheet.cell(
+            company.excel_row,
+            tracking_columns["重複資料檢查"],
         ).value
     )
 
-    # 舊版只做繳費紀錄查詢；沒有雙階段標記時必須重新處理，
-    # 才能補上可線上與不可線上繳納的目前違規資料。
     if (
         COMBINED_QUERY_MESSAGE_MARKER
         not in query_message
+        or PAGINATION_VERIFIED_MARKER
+        not in query_message
+        or PAGINATION_VERIFIED_MARKER
+        not in integrity_value
+        or "無重複" not in duplicate_value
     ):
         return False
 
+    for header in (
+        "可線上繳納分頁資訊",
+        "不可線上繳納分頁資訊",
+        "繳納紀錄分頁資訊",
+    ):
+        value = normalize_text(
+            worksheet.cell(
+                company.excel_row,
+                tracking_columns[header],
+            ).value
+        )
+        if (
+            "頁，共" not in value
+            or "已擷取" not in value
+            or "重複 0 筆" not in value
+        ):
+            return False
+
     record_count_value = worksheet.cell(
         company.excel_row,
-        tracking_columns[
-            "交通違規筆數"
-        ],
+        tracking_columns["交通違規筆數"],
     ).value
 
     try:
-        record_count = int(
-            record_count_value
-        )
-    except (
-        TypeError,
-        ValueError,
-    ):
-        record_count = None
+        record_count = int(record_count_value)
+    except (TypeError, ValueError):
+        return False
 
-    # 成功且 0 筆時本來就不會建立明細工作表，續跑應直接略過。
     if record_count == 0:
         return True
 
@@ -5930,54 +8411,41 @@ def should_skip_row(
     )
 
     if expected_title not in workbook.sheetnames:
-        # 舊版可能建立成 00155598；
-        # 新版要求使用 155598，因此必須重做。
         return False
 
-    detail_sheet = workbook[
-        expected_title
-    ]
+    detail_sheet = workbook[expected_title]
 
-    if detail_sheet.max_column > 7:
-        # 舊版 A:P 大型頁面導覽雜訊。
+    if detail_sheet.max_column < DETAIL_AUDIT_LAST_COLUMN:
         return False
 
-    first_values = {
-        normalize_text(
-            detail_sheet.cell(
-                row,
-                column,
-            ).value
-        )
-        for row in range(
-            1,
-            min(
-                detail_sheet.max_row,
-                8,
-            ) + 1,
-        )
-        for column in range(
-            1,
-            min(
-                detail_sheet.max_column,
-                7,
-            ) + 1,
-        )
-    }
+    nonempty_data_rows = 0
 
-    if first_values.intersection(
-        {
-            "統一編號",
-            "登記名稱",
-            "查詢狀態",
-            "違規筆數",
-            "查詢時間",
-            "來源網址",
-        }
-    ):
-        return False
+    for row in range(1, detail_sheet.max_row + 1):
+        if any(
+            normalize_text(
+                detail_sheet.cell(row, column).value
+            )
+            for column in range(1, 8)
+        ):
+            nonempty_data_rows += 1
 
-    return True
+        if not normalize_text(
+            detail_sheet.cell(row, 10).value
+        ).startswith("擷取頁碼："):
+            return False
+
+        if not normalize_text(
+            detail_sheet.cell(row, 13).value
+        ).startswith("分頁資訊："):
+            return False
+
+        if not normalize_text(
+            detail_sheet.cell(row, 14).value
+        ).startswith("資料唯一鍵："):
+            return False
+
+    return nonempty_data_rows == record_count
+
 def update_main_row(
     worksheet: Any,
     company: CompanyRow,
@@ -5997,6 +8465,27 @@ def update_main_row(
         "違規查詢狀態": outcome.status,
         "最後查詢時間": queried_at,
         "違規查詢訊息": outcome.message,
+        "可線上繳納分頁資訊": outcome_group_summary(
+            outcome,
+            QUERY_SECTION_CURRENT,
+            CURRENT_ONLINE_CATEGORY,
+        ),
+        "不可線上繳納分頁資訊": outcome_group_summary(
+            outcome,
+            QUERY_SECTION_CURRENT,
+            CURRENT_OFFLINE_CATEGORY,
+        ),
+        "繳納紀錄分頁資訊": outcome_group_summary(
+            outcome,
+            QUERY_SECTION_PAID,
+            PAID_RECORD_CATEGORY,
+        ),
+        "分頁完整性檢查": outcome_integrity_text(
+            outcome
+        ),
+        "重複資料檢查": outcome_duplicate_text(
+            outcome
+        ),
     }
 
     style_source = worksheet.cell(
@@ -6012,18 +8501,13 @@ def update_main_row(
         )
 
         if header != "交通違規筆數":
-            cell.fill = copy(
-                style_source.fill
-            )
-            cell.font = copy(
-                style_source.font
-            )
+            cell.fill = copy(style_source.fill)
+            cell.font = copy(style_source.font)
 
         cell.alignment = Alignment(
             vertical="top",
             wrap_text=True,
         )
-
         cell.border = Border(
             left=THIN_GRAY,
             right=THIN_GRAY,
@@ -6033,13 +8517,8 @@ def update_main_row(
 
     worksheet.cell(
         company.excel_row,
-        tracking_columns[
-            "最後查詢時間"
-        ],
-    ).number_format = (
-        "yyyy-mm-dd hh:mm:ss"
-    )
-
+        tracking_columns["最後查詢時間"],
+    ).number_format = "yyyy-mm-dd hh:mm:ss"
 
 def launch_browser(
     playwright: Any,
@@ -6090,14 +8569,114 @@ def launch_browser(
     )
 
 
+def create_browser_context_and_page(
+    browser: Browser,
+    timeout_ms: int,
+) -> tuple[Any, Page]:
+    context = browser.new_context(
+        locale="zh-TW",
+        viewport={
+            "width": 1440,
+            "height": 1000,
+        },
+        ignore_https_errors=False,
+    )
+    page = context.new_page()
+    page.set_default_timeout(timeout_ms)
+    return context, page
+
+
+def safe_close_page(
+    page: Page | None,
+) -> None:
+    if page is None:
+        return
+    try:
+        if not page.is_closed():
+            page.close()
+    except Exception:
+        pass
+
+
+def safe_close_context(
+    context: Any | None,
+) -> None:
+    if context is None:
+        return
+    try:
+        context.close()
+    except Exception:
+        pass
+
+
+def safe_close_browser(
+    browser: Browser | None,
+) -> None:
+    if browser is None:
+        return
+    try:
+        browser.close()
+    except Exception:
+        pass
+
+
+def restart_browser_session(
+    playwright: Any,
+    browser: Browser | None,
+    context: Any | None,
+    page: Page | None,
+    *,
+    headless: bool,
+    timeout_ms: int,
+    reason: str,
+) -> tuple[Browser, Any, Page]:
+    """關閉失效的 Page／Context，必要時重啟 Browser，再建立新 Page。"""
+    print(
+        "  偵測到瀏覽器工作階段失效，正在自動重建："
+        f"{reason}",
+        flush=True,
+    )
+
+    safe_close_page(page)
+    safe_close_context(context)
+
+    if not browser_is_connected(browser):
+        safe_close_browser(browser)
+        browser = launch_browser(
+            playwright,
+            headless,
+        )
+
+    try:
+        new_context, new_page = (
+            create_browser_context_and_page(
+                browser,
+                timeout_ms,
+            )
+        )
+    except Exception:
+        safe_close_browser(browser)
+        browser = launch_browser(
+            playwright,
+            headless,
+        )
+        new_context, new_page = (
+            create_browser_context_and_page(
+                browser,
+                timeout_ms,
+            )
+        )
+
+    return browser, new_context, new_page
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "依 Excel 統一編號先查交通違規（含強制險），"
-            "再查法人交通違規繳費紀錄；"
-            "結果優先從 hidden JSON 讀取，"
-            "明細工作表沿用來源 155598 格式。"
+            "再查法人交通違規繳納記錄；"
+            "兩階段均逐頁擷取，並以 showbanner 的總頁數／總筆數"
+            "驗證完整性與重複資料。"
         )
     )
 
@@ -6111,165 +8690,155 @@ def build_parser() -> argparse.ArgumentParser:
             r"Data\高雄市.xlsx"
         ),
     )
-
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
         help=(
-            "輸出 Excel；預設輸出到 results "
-            "資料夾，檔名為 "
+            "輸出 Excel；預設輸出到 results 資料夾，檔名為 "
             "<來源檔名>_違規明細查詢結果.xlsx"
         ),
     )
-
     parser.add_argument(
         "--detail-template-sheet",
         default=DEFAULT_DETAIL_TEMPLATE_SHEET,
-        help=(
-            "來源 Excel 中作為明細格式範本的工作表；"
-            "預設 155598"
-        ),
+        help="來源 Excel 的明細格式範本工作表；預設 155598",
     )
-
     parser.add_argument(
         "--current-query-url",
         default=DEFAULT_CURRENT_QUERY_URL,
         help=(
             "第一階段交通違規（含強制險）入口網址；"
-            "預設先使用原本 legal 入口，找不到時自動改用 penaltyQueryPay"
+            "找不到時自動改用 penaltyQueryPay"
         ),
     )
-
     parser.add_argument(
         "--url",
         default=DEFAULT_URL,
-        help="查詢網址",
+        help="第二階段交通違規繳納記錄查詢網址",
     )
-
     parser.add_argument(
         "--start-row",
         type=int,
         default=None,
         help="從指定 Excel 列開始",
     )
-
     parser.add_argument(
         "--end-row",
         type=int,
         default=None,
         help="查到指定 Excel 列為止",
     )
-
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help="最多處理幾筆，適合先小量測試",
     )
-
     parser.add_argument(
         "--headless",
         action="store_true",
-        help=(
-            "Playwright 使用無頭模式；"
-            "englishAlphanumeric.py 的人工 UI "
-            "仍會在本機顯示"
-        ),
+        help="Playwright 使用無頭模式",
     )
-
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "輸出檔存在時續跑，"
-            "略過狀態為成功／無資料的列"
+            "輸出檔存在時續跑；只有已通過新版分頁完整性"
+            "與重複資料檢查的列才會略過"
         ),
     )
-
     parser.add_argument(
         "--overwrite-output",
         action="store_true",
-        help=(
-            "若輸出檔已存在，"
-            "刪除並從來源檔重新開始"
-        ),
+        help="若輸出檔已存在，刪除並從來源檔重新開始",
     )
-
     parser.add_argument(
         "--timeout",
         type=int,
         default=30000,
         help="一般網頁逾時毫秒",
     )
-
     parser.add_argument(
         "--max-captcha-attempts",
         type=int,
         default=5,
-        help=(
-            "同一輪處理單筆資料時，最多重新取得 CAPTCHA "
-            "並呼叫 imageInput() 的次數"
-        ),
+        help="單輪處理同一筆資料時，最多重新取得 CAPTCHA 的次數",
     )
-
     parser.add_argument(
         "--max-captcha-requeues",
         type=int,
         default=1,
         help=(
-            "同一筆資料耗盡 CAPTCHA 嘗試次數後，"
-            "最多移到工作佇列尾端重做幾次；預設 1 次"
+            "耗盡 CAPTCHA 嘗試後，最多移到工作佇列尾端重做幾次；"
+            "預設 1 次"
         ),
     )
-
+    parser.add_argument(
+        "--max-integrity-attempts",
+        type=int,
+        default=3,
+        help=(
+            "分頁頁數、總筆數或重複資料驗證失敗時，"
+            "立即重爬同一家公司最多幾次；預設 3 次"
+        ),
+    )
+    parser.add_argument(
+        "--max-browser-restarts",
+        type=int,
+        default=3,
+        help=(
+            "Page／BrowserContext／Browser 意外關閉時，"
+            "自動重建瀏覽器並立即重跑目前公司最多幾次；預設 3 次"
+        ),
+    )
+    parser.add_argument(
+        "--stop-on-integrity-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "完整性驗證連續失敗達上限後停止整批，不處理下一家公司；"
+            "預設啟用"
+        ),
+    )
     parser.add_argument(
         "--delay-min",
         type=float,
         default=1.5,
         help="每筆查詢後最短等待秒數",
     )
-
     parser.add_argument(
         "--delay-max",
         type=float,
         default=3.0,
         help="每筆查詢後最長等待秒數",
     )
-
     parser.add_argument(
         "--captcha-dir",
         type=Path,
         default=DEFAULT_CAPTCHA_DIR,
-        help=(
-            "保存每次驗證碼圖片的資料夾；"
-            "另會更新 current_captcha.png "
-            "或 current_captcha.jpg"
-        ),
+        help="保存每次驗證碼圖片的資料夾",
     )
-
     parser.add_argument(
         "--captcha-image-format",
-        choices=(
-            "png",
-            "jpg",
-            "jpeg",
-        ),
+        choices=("png", "jpg", "jpeg"),
         default="png",
-        help=(
-            "傳入 imageInput() "
-            "前保存的圖片格式；預設 png"
-        ),
+        help="驗證碼圖片格式；預設 png",
     )
-
     parser.add_argument(
         "--debug-dir",
         type=Path,
         default=DEFAULT_DEBUG_DIR,
+        help="保存除錯 HTML 與截圖的資料夾",
+    )
+    parser.add_argument(
+        "--error-log-dir",
+        type=Path,
+        default=DEFAULT_ERROR_LOG_DIR,
         help=(
-            "無法辨識頁面時保存 "
-            "HTML 與截圖的資料夾"
+            "分頁不完整、重複資料、未解決錯誤等 JSON 紀錄資料夾；"
+            r"預設 results\mvdis_errorLog"
         ),
     )
 
@@ -6280,27 +8849,14 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
 
-    input_path = (
-        args.input
-        .expanduser()
-        .resolve()
-    )
-
-    results_dir = (
-        DEFAULT_RESULTS_DIR
-        .expanduser()
-        .resolve()
-    )
+    input_path = args.input.expanduser().resolve()
+    results_dir = DEFAULT_RESULTS_DIR.expanduser().resolve()
 
     if not input_path.exists():
-        raise SystemExit(
-            f"找不到來源檔：{input_path}"
-        )
+        raise SystemExit(f"找不到來源檔：{input_path}")
 
     if input_path.suffix.lower() != ".xlsx":
-        raise SystemExit(
-            "目前只支援 .xlsx"
-        )
+        raise SystemExit("目前只支援 .xlsx")
 
     if (
         args.delay_min < 0
@@ -6320,25 +8876,31 @@ def main(
             "max-captcha-requeues 不可小於 0"
         )
 
+    if args.max_integrity_attempts <= 0:
+        raise SystemExit(
+            "max-integrity-attempts 必須大於 0"
+        )
+
+    if args.max_browser_restarts < 0:
+        raise SystemExit(
+            "max-browser-restarts 不可小於 0"
+        )
+
     try:
         normalize_captcha_image_format(
             args.captcha_image_format
         )
     except ValueError as exc:
-        raise SystemExit(
-            str(exc)
-        ) from exc
+        raise SystemExit(str(exc)) from exc
 
     if not callable(ocrImage):
         raise SystemExit(
-            "from englishAlphanumeric import imageInput "
+            "from englishAlphanumericOcrApi import ocrImage "
             "匯入的物件不是可呼叫函式"
         )
 
     output_path = (
-        args.output
-        .expanduser()
-        .resolve()
+        args.output.expanduser().resolve()
         if args.output
         else (
             results_dir
@@ -6351,8 +8913,7 @@ def main(
 
     if output_path == input_path:
         raise SystemExit(
-            "輸出檔不能與來源檔相同；"
-            "本程式不會覆寫原始 Excel"
+            "輸出檔不能與來源檔相同；本程式不會覆寫原始 Excel"
         )
 
     new_output = (
@@ -6360,10 +8921,7 @@ def main(
         or args.overwrite_output
     )
 
-    if (
-        args.overwrite_output
-        and output_path.exists()
-    ):
+    if args.overwrite_output and output_path.exists():
         output_path.unlink()
 
     if new_output:
@@ -6371,15 +8929,8 @@ def main(
             parents=True,
             exist_ok=True,
         )
-
-        shutil.copy2(
-            input_path,
-            output_path,
-        )
-
-        print(
-            f"已建立新輸出檔：{output_path}"
-        )
+        shutil.copy2(input_path, output_path)
+        print(f"已建立新輸出檔：{output_path}")
     else:
         print(
             "偵測到既有輸出檔，將續跑："
@@ -6387,16 +8938,13 @@ def main(
         )
 
     workbook = load_workbook(output_path)
-
     (
         main_sheet,
         header_start_row,
         data_start_row,
         id_col,
         name_col,
-    ) = find_main_sheet_and_columns(
-        workbook
-    )
+    ) = find_main_sheet_and_columns(workbook)
 
     detail_template_sheet_name = (
         ensure_detail_template(
@@ -6426,6 +8974,12 @@ def main(
         )
 
     log_sheet = ensure_log_sheet(workbook)
+    pagination_audit_sheet = (
+        ensure_pagination_audit_sheet(workbook)
+    )
+    duplicate_audit_sheet = (
+        ensure_duplicate_audit_sheet(workbook)
+    )
 
     companies = iter_companies(
         main_sheet,
@@ -6439,20 +8993,17 @@ def main(
 
     if not companies:
         raise SystemExit(
-            "指定範圍內沒有可用的"
-            "統一編號／登記編號"
+            "指定範圍內沒有可用的統一編號／登記編號"
         )
 
-    captcha_dir = (
-        args.captcha_dir
-        .expanduser()
-        .resolve()
+    captcha_dir = args.captcha_dir.expanduser().resolve()
+    debug_dir = args.debug_dir.expanduser().resolve()
+    error_log_dir = (
+        args.error_log_dir.expanduser().resolve()
     )
-
-    debug_dir = (
-        args.debug_dir
-        .expanduser()
-        .resolve()
+    error_log_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     print(
@@ -6461,73 +9012,44 @@ def main(
         f"名稱欄：{get_column_letter(name_col)}；"
         f"待掃描：{len(companies)} 筆。"
     )
-
+    print(f"來源 Excel：{input_path}")
+    print(f"輸出 Excel：{output_path}")
     print(
-        f"來源 Excel：{input_path}"
+        "第二階段分頁資訊 XPath："
+        f"{PAID_PAGINATION_BANNER_XPATH}"
     )
-
     print(
-        f"輸出 Excel：{output_path}"
+        "第一階段分頁資訊 XPath："
+        f"{CURRENT_PAGINATION_BANNER_XPATH}"
     )
-
-    print(
-        "CAPTCHA 圖片 XPath："
-        f"{CAPTCHA_IMAGE_XPATH}"
-    )
-
-    print(
-        "CAPTCHA 擷取區塊備援 XPath："
-        f"{CAPTCHA_CAPTURE_XPATH}"
-    )
-
-    print(
-        "第一階段法人頁籤 XPath："
-        f"{CURRENT_QUERY_CORPORATE_TAB_XPATH}"
-    )
-
-    print(
-        "第一階段查詢按鈕 XPath："
-        f"{CURRENT_QUERY_BUTTON_XPATH}"
-    )
-
     print(
         "第一階段結果表格 XPath："
         f"{CURRENT_RESULT_TABLE_XPATH}"
     )
-
     print(
         "第一階段第二頁籤 XPath："
         f"{CURRENT_RESULT_SECOND_TAB_XPATH}"
     )
-
     print(
-        "查詢按鈕 XPath："
-        f"{QUERY_BUTTON_XPATH}"
-    )
-
-    print(
-        "結果 JSON XPath："
+        "結果 JSON XPath（僅作目前頁備援）："
         f"{RESULT_JSON_XPATH}"
     )
-
-    print(
-        "查無已繳納罰鍰資料 XPath："
-        f"{NO_PAID_DATA_XPATH}"
-    )
-
     print(
         "違規明細格式範本："
         f"{args.detail_template_sheet} "
         f"→ {detail_template_sheet_name}"
     )
-
+    print(f"驗證碼圖片資料夾：{captcha_dir}")
+    print(f"錯誤 JSON 資料夾：{error_log_dir}")
     print(
-        "人工驗證碼副程式："
-        "imageInput(image)"
+        "完整性失敗策略：同一家公司立即重爬 "
+        f"{args.max_integrity_attempts} 次；"
+        f"達上限後"
+        f"{'停止整批' if args.stop_on_integrity_error else '記錄錯誤後繼續'}。"
     )
-
     print(
-        f"驗證碼圖片資料夾：{captcha_dir}"
+        "瀏覽器失效策略：自動重建 Page／Context／Browser，"
+        f"同一家公司立即重跑最多 {args.max_browser_restarts} 次。"
     )
 
     processed = 0
@@ -6539,9 +9061,9 @@ def main(
     skipped = 0
     deferred = 0
     queue_runs = 0
+    integrity_retries = 0
+    browser_restarts = 0
 
-    # 每個項目為：(公司資料, 已移到佇列尾端的次數)。
-    # CAPTCHA 失敗時 append 回 deque 尾端，其他公司會先被處理。
     work_queue = deque(
         (company, 0)
         for company in companies
@@ -6552,19 +9074,9 @@ def main(
             playwright,
             args.headless,
         )
-
-        context = browser.new_context(
-            locale="zh-TW",
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-            ignore_https_errors=False,
-        )
-
-        page = context.new_page()
-        page.set_default_timeout(
-            args.timeout
+        context, page = create_browser_context_and_page(
+            browser,
+            args.timeout,
         )
 
         try:
@@ -6572,6 +9084,21 @@ def main(
                 company, requeue_count = (
                     work_queue.popleft()
                 )
+
+                if (
+                    not browser_is_connected(browser)
+                    or not page_is_open(page)
+                ):
+                    browser, context, page = restart_browser_session(
+                        playwright,
+                        browser,
+                        context,
+                        page,
+                        headless=args.headless,
+                        timeout_ms=args.timeout,
+                        reason="開始處理公司前檢查到工作階段已失效",
+                    )
+                    browser_restarts += 1
 
                 if should_skip_row(
                     workbook,
@@ -6582,11 +9109,9 @@ def main(
                 ):
                     skipped += 1
                     print(
-                        f"[已完成 {processed}/"
-                        f"{len(companies)}] "
-                        f"{company.query_id} "
-                        f"{company.name}："
-                        "先前已成功／無資料，略過。"
+                        f"[已完成 {processed}/{len(companies)}] "
+                        f"{company.query_id} {company.name}："
+                        "已通過分頁完整性與重複檢查，略過。"
                     )
                     continue
 
@@ -6600,113 +9125,281 @@ def main(
                         f"{args.max_captcha_requeues}"
                     )
                 )
-
                 print(
                     f"[執行 {queue_runs}；"
-                    f"已完成 {processed}/"
-                    f"{len(companies)}；"
+                    f"已完成 {processed}/{len(companies)}；"
                     f"佇列尚有 {len(work_queue)}] "
-                    f"查詢 {company.query_id} "
-                    f"{company.name}"
+                    f"查詢 {company.query_id} {company.name}"
                     f"{retry_label}",
                     flush=True,
                 )
 
                 queried_at = datetime.now()
+                outcome: QueryOutcome | None = None
+                stop_after_current = False
 
-                try:
-                    print(
-                        "  [階段 1/2] 交通違規（含強制險）查詢及繳納",
-                        flush=True,
-                    )
+                integrity_attempt = 1
+                company_browser_restarts = 0
 
-                    current_outcome = (
-                        perform_current_violation_query(
-                            page=page,
-                            company=company,
-                            entry_url=(
-                                args.current_query_url
-                            ),
-                            timeout_ms=args.timeout,
-                            max_captcha_attempts=(
-                                args.max_captcha_attempts
-                            ),
-                            debug_dir=debug_dir,
-                            captcha_dir=captcha_dir,
-                            captcha_image_format=(
-                                args.captcha_image_format
+                while (
+                    integrity_attempt
+                    <= args.max_integrity_attempts
+                ):
+                    try:
+                        print(
+                            "  [階段 1/2] 交通違規（含強制險）查詢及繳納",
+                            flush=True,
+                        )
+                        current_outcome = (
+                            perform_current_violation_query(
+                                page=page,
+                                company=company,
+                                entry_url=(
+                                    args.current_query_url
+                                ),
+                                timeout_ms=args.timeout,
+                                max_captcha_attempts=(
+                                    args.max_captcha_attempts
+                                ),
+                                debug_dir=debug_dir,
+                                captcha_dir=captcha_dir,
+                                captcha_image_format=(
+                                    args.captcha_image_format
+                                ),
+                            )
+                        )
+
+                        print(
+                            "  [階段 2/2] 法人交通違規繳納記錄查詢",
+                            flush=True,
+                        )
+                        paid_outcome = (
+                            perform_paid_record_query(
+                                page=page,
+                                company=company,
+                                query_url=args.url,
+                                timeout_ms=args.timeout,
+                                max_captcha_attempts=(
+                                    args.max_captcha_attempts
+                                ),
+                                debug_dir=debug_dir,
+                                captcha_dir=captcha_dir,
+                                captcha_image_format=(
+                                    args.captcha_image_format
+                                ),
+                                headless=args.headless,
+                            )
+                        )
+
+                        outcome = combine_query_outcomes(
+                            current_outcome,
+                            paid_outcome,
+                        )
+                        break
+
+                    except KeyboardInterrupt:
+                        print(
+                            "\n使用者中止。已保存目前進度。"
+                        )
+                        atomic_save(
+                            workbook,
+                            output_path,
+                        )
+                        return 130
+
+                    except DataIntegrityError as exc:
+                        integrity_retries += 1
+                        save_debug_artifacts(
+                            page,
+                            debug_dir,
+                            company.query_id,
+                            (
+                                "integrity_error_"
+                                f"{integrity_attempt}"
                             ),
                         )
-                    )
-
-                    print(
-                        "  [階段 2/2] 法人交通違規繳費紀錄查詢",
-                        flush=True,
-                    )
-
-                    paid_outcome = (
-                        perform_paid_record_query(
-                            page=page,
-                            company=company,
-                            query_url=args.url,
-                            timeout_ms=args.timeout,
-                            max_captcha_attempts=(
-                                args.max_captcha_attempts
+                        error_path = write_error_json(
+                            error_log_dir,
+                            company,
+                            phase=(
+                                "分頁完整性驗證失敗_"
+                                f"第{integrity_attempt}次"
                             ),
-                            debug_dir=debug_dir,
-                            captcha_dir=captcha_dir,
-                            captcha_image_format=(
-                                args.captcha_image_format
+                            message=str(exc),
+                            page=(
+                                page
+                                if page_is_open(page)
+                                else None
                             ),
-                            headless=args.headless,
+                            exception=exc,
+                            details={
+                                "integrity_attempt": (
+                                    integrity_attempt
+                                ),
+                                "max_integrity_attempts": (
+                                    args.max_integrity_attempts
+                                ),
+                            },
                         )
-                    )
+                        print(
+                            "  → 分頁完整性未通過；"
+                            f"{exc}；錯誤 JSON：{error_path}",
+                            flush=True,
+                        )
 
-                    outcome = combine_query_outcomes(
-                        current_outcome,
-                        paid_outcome,
-                    )
+                        if (
+                            integrity_attempt
+                            < args.max_integrity_attempts
+                        ):
+                            integrity_attempt += 1
+                            print(
+                                "  不處理下一家公司，立即重新爬取"
+                                f"目前公司（{integrity_attempt}/"
+                                f"{args.max_integrity_attempts}）。",
+                                flush=True,
+                            )
+                            time.sleep(
+                                random.uniform(
+                                    args.delay_min,
+                                    args.delay_max,
+                                )
+                            )
+                            continue
 
-                except KeyboardInterrupt:
-                    print(
-                        "\n使用者中止。"
-                        "已保存目前進度。"
-                    )
+                        outcome = QueryOutcome(
+                            status=STATUS_ERROR,
+                            record_count=0,
+                            tables=[],
+                            message=(
+                                "分頁完整性驗證連續失敗 "
+                                f"{args.max_integrity_attempts} 次；"
+                                f"{exc}；已輸出 JSON，不會把不完整資料"
+                                "標成成功"
+                            ),
+                            result_url=safe_page_url(page),
+                        )
+                        stop_after_current = (
+                            args.stop_on_integrity_error
+                        )
+                        break
 
-                    atomic_save(
-                        workbook,
-                        output_path,
-                    )
+                    except Exception as exc:
+                        if is_browser_session_closed_exception(exc):
+                            company_browser_restarts += 1
+                            browser_restarts += 1
 
-                    return 130
+                            error_path = write_error_json(
+                                error_log_dir,
+                                company,
+                                phase=(
+                                    "瀏覽器工作階段失效_"
+                                    f"第{company_browser_restarts}次"
+                                ),
+                                message=(
+                                    f"{type(exc).__name__}: {exc}"
+                                ),
+                                page=None,
+                                exception=exc,
+                                details={
+                                    "browser_restart_attempt": (
+                                        company_browser_restarts
+                                    ),
+                                    "max_browser_restarts": (
+                                        args.max_browser_restarts
+                                    ),
+                                },
+                            )
 
-                except Exception as exc:
-                    save_debug_artifacts(
-                        page,
-                        debug_dir,
-                        company.query_id,
-                        "exception",
-                    )
+                            if (
+                                company_browser_restarts
+                                <= args.max_browser_restarts
+                            ):
+                                browser, context, page = (
+                                    restart_browser_session(
+                                        playwright,
+                                        browser,
+                                        context,
+                                        page,
+                                        headless=args.headless,
+                                        timeout_ms=args.timeout,
+                                        reason=(
+                                            f"{type(exc).__name__}: {exc}"
+                                        ),
+                                    )
+                                )
+                                print(
+                                    "  已建立新的 Page／Context，"
+                                    "立即重跑目前公司，不移到下一筆；"
+                                    f"錯誤 JSON：{error_path}",
+                                    flush=True,
+                                )
+                                continue
 
-                    retryable_exception = (
-                        is_captcha_related_exception(exc)
-                        or is_transient_page_exception(exc)
-                    )
+                            outcome = QueryOutcome(
+                                status=STATUS_RETRY,
+                                record_count=0,
+                                tables=[],
+                                message=(
+                                    "瀏覽器工作階段連續失效 "
+                                    f"{company_browser_restarts} 次；"
+                                    f"{type(exc).__name__}: {exc}"
+                                ),
+                                result_url="",
+                                retry_later=True,
+                            )
+                            print(
+                                "  瀏覽器自動重建已達上限；"
+                                f"錯誤 JSON：{error_path}",
+                                flush=True,
+                            )
+                            break
 
-                    outcome = QueryOutcome(
-                        (
-                            STATUS_RETRY
-                            if retryable_exception
-                            else STATUS_ERROR
-                        ),
-                        0,
-                        [],
-                        (
-                            f"{type(exc).__name__}: "
-                            f"{exc}"
-                        ),
-                        page.url,
-                        retry_later=retryable_exception,
+                        save_debug_artifacts(
+                            page,
+                            debug_dir,
+                            company.query_id,
+                            "exception",
+                        )
+                        retryable_exception = (
+                            is_captcha_related_exception(exc)
+                            or is_transient_page_exception(exc)
+                        )
+                        outcome = QueryOutcome(
+                            status=(
+                                STATUS_RETRY
+                                if retryable_exception
+                                else STATUS_ERROR
+                            ),
+                            record_count=0,
+                            tables=[],
+                            message=(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            result_url=safe_page_url(page),
+                            retry_later=retryable_exception,
+                        )
+                        error_path = write_error_json(
+                            error_log_dir,
+                            company,
+                            phase="查詢例外",
+                            message=outcome.message,
+                            page=(
+                                page
+                                if page_is_open(page)
+                                else None
+                            ),
+                            exception=exc,
+                            outcome=outcome,
+                        )
+                        print(
+                            f"  例外已寫入 JSON：{error_path}",
+                            flush=True,
+                        )
+                        break
+
+                if outcome is None:
+                    raise RuntimeError(
+                        "內部錯誤：查詢結束後沒有 QueryOutcome"
                     )
 
                 if outcome.retry_later:
@@ -6717,23 +9410,31 @@ def main(
                         next_requeue_count = (
                             requeue_count + 1
                         )
-
                         deferred_outcome = QueryOutcome(
-                            STATUS_RETRY,
-                            0,
-                            [],
-                            (
+                            status=STATUS_RETRY,
+                            record_count=0,
+                            tables=[],
+                            message=(
                                 f"{outcome.message}；"
-                                "已移到工作佇列尾端，"
-                                "其他資料完成後將自動重做"
-                                f"（隊尾重試 "
-                                f"{next_requeue_count}/"
+                                "已移到工作佇列尾端，其他資料完成後"
+                                "將自動重做"
+                                f"（隊尾重試 {next_requeue_count}/"
                                 f"{args.max_captcha_requeues}）"
                             ),
-                            outcome.result_url,
+                            result_url=outcome.result_url,
                             retry_later=True,
+                            page_audits=(
+                                outcome.page_audits
+                            ),
+                            duplicate_keys=(
+                                outcome.duplicate_keys
+                            ),
                         )
-
+                        remove_existing_detail_variants(
+                            workbook,
+                            company.raw_id,
+                            company.query_id,
+                        )
                         update_main_row(
                             main_sheet,
                             company,
@@ -6741,32 +9442,39 @@ def main(
                             queried_at,
                             tracking_columns,
                         )
-
                         append_log(
                             log_sheet,
                             company,
                             deferred_outcome,
                             queried_at,
                         )
-
-                        work_queue.append(
-                            (
-                                company,
-                                next_requeue_count,
-                            )
+                        replace_company_audit_rows(
+                            pagination_audit_sheet,
+                            duplicate_audit_sheet,
+                            company,
+                            deferred_outcome,
+                            queried_at,
                         )
-
+                        work_queue.append(
+                            (company, next_requeue_count)
+                        )
+                        error_path = write_error_json(
+                            error_log_dir,
+                            company,
+                            phase="待重試_已移到隊尾",
+                            message=deferred_outcome.message,
+                            page=(page if page_is_open(page) else None),
+                            outcome=deferred_outcome,
+                        )
                         atomic_save(
                             workbook,
                             output_path,
                         )
-
                         deferred += 1
-
                         print(
                             "  → 待重試；"
                             f"{company.query_id} 已排到佇列尾端；"
-                            f"目前佇列共有 {len(work_queue)} 筆。",
+                            f"JSON：{error_path}",
                             flush=True,
                         )
 
@@ -6777,21 +9485,22 @@ def main(
                                     args.delay_max,
                                 )
                             )
-
                         continue
 
                     outcome = QueryOutcome(
-                        STATUS_RETRY,
-                        0,
-                        [],
-                        (
+                        status=STATUS_RETRY,
+                        record_count=0,
+                        tables=[],
+                        message=(
                             f"{outcome.message}；"
                             "已達本次執行允許的隊尾重試上限 "
                             f"{args.max_captcha_requeues} 次；"
-                            "保留為待重試，下一次使用 --resume 執行時會自動重做"
+                            "保留為待重試，下次使用 --resume 執行時"
+                            "會自動重做"
                         ),
-                        outcome.result_url,
-                        retry_later=False,
+                        result_url=outcome.result_url,
+                        page_audits=outcome.page_audits,
+                        duplicate_keys=outcome.duplicate_keys,
                     )
 
                 update_main_row(
@@ -6803,6 +9512,9 @@ def main(
                 )
 
                 if outcome.status == STATUS_SUCCESS:
+                    validate_page_audits(
+                        outcome.page_audits
+                    )
                     if outcome.record_count > 0:
                         write_detail_sheet(
                             workbook,
@@ -6812,14 +9524,12 @@ def main(
                             queried_at,
                         )
                     else:
-                        # 零筆成功不應保留舊的明細工作表。
                         remove_existing_detail_variants(
                             workbook,
                             company.raw_id,
                             company.query_id,
                         )
                         zero_result_success += 1
-
                     success += 1
 
                 elif outcome.status == STATUS_NO_DATA:
@@ -6831,11 +9541,30 @@ def main(
                     no_data += 1
 
                 elif outcome.status == STATUS_RETRY:
+                    # 不保留舊版可能漏頁的明細，避免使用者誤把舊資料當成本次結果。
+                    remove_existing_detail_variants(
+                        workbook,
+                        company.raw_id,
+                        company.query_id,
+                    )
                     pending += 1
 
                 else:
+                    # 完整性或不可恢復錯誤時，移除舊的不完整明細工作表。
+                    remove_existing_detail_variants(
+                        workbook,
+                        company.raw_id,
+                        company.query_id,
+                    )
                     errors += 1
 
+                replace_company_audit_rows(
+                    pagination_audit_sheet,
+                    duplicate_audit_sheet,
+                    company,
+                    outcome,
+                    queried_at,
+                )
                 append_log(
                     log_sheet,
                     company,
@@ -6843,19 +9572,41 @@ def main(
                     queried_at,
                 )
 
-                atomic_save(
-                    workbook,
-                    output_path,
-                )
+                if outcome.status != STATUS_SUCCESS:
+                    error_path = write_error_json(
+                        error_log_dir,
+                        company,
+                        phase=(
+                            "最終錯誤"
+                            if outcome.status == STATUS_ERROR
+                            else "最終待重試"
+                        ),
+                        message=outcome.message,
+                        page=(page if page_is_open(page) else None),
+                        outcome=outcome,
+                    )
+                    print(
+                        f"  問題已寫入 JSON：{error_path}",
+                        flush=True,
+                    )
 
+                atomic_save(workbook, output_path)
                 processed += 1
 
                 print(
                     f"  → {outcome.status}；"
-                    f"違規筆數="
-                    f"{outcome.record_count}；"
+                    f"違規筆數={outcome.record_count}；"
                     f"{outcome.message}"
                 )
+
+                if stop_after_current:
+                    print(
+                        "完整性驗證已達重試上限。"
+                        "依預設設定停止整批，沒有處理下一家公司。"
+                    )
+                    print(f"輸出檔：{output_path}")
+                    print(f"錯誤 JSON：{error_log_dir}")
+                    return 3
 
                 if work_queue:
                     time.sleep(
@@ -6866,29 +9617,26 @@ def main(
                     )
 
         finally:
-            context.close()
-            browser.close()
+            safe_close_page(page)
+            safe_close_context(context)
+            safe_close_browser(browser)
 
     print(
         f"完成。最終處理 {processed} 筆："
-        f"成功 {success}"
-        f"（其中零筆 {zero_result_success}）、"
+        f"成功 {success}（其中零筆 {zero_result_success}）、"
         f"舊版無資料 {no_data}、"
         f"待重試 {pending}、"
         f"錯誤 {errors}；"
         f"略過 {skipped}、"
-        f"曾移至隊尾 {deferred} 次。"
+        f"曾移至隊尾 {deferred} 次、"
+        f"完整性立即重爬 {integrity_retries} 次、"
+        f"瀏覽器自動重建 {browser_restarts} 次。"
     )
+    print(f"輸出檔：{output_path}")
+    print(f"錯誤 JSON：{error_log_dir}")
 
-    print(
-        f"輸出檔：{output_path}"
-    )
+    return 0 if errors == 0 else 2
 
-    return (
-        0
-        if errors == 0
-        else 2
-    )
 
 
 if __name__ == "__main__":
