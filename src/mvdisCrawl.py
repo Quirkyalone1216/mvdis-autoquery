@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: PAGINATION_SCOPED_LINK_SERVER_CONFIRMED_2026-08-01
+# VERSION: MULTI_CITY_INPUTS_PAGINATION_SCOPED_LINK_2026-08-01
 """
 監理服務網法人交通違規雙階段批次查詢工具。
 
 主要流程：
-1. 從 Excel 讀取統一編號／登記編號與登記名稱。
-2. 使用 Playwright 先查詢「交通違規（含強制險）查詢及繳納」。
-3. 分別完整擷取「可線上繳納」與「不可線上繳納」的每一頁。
-4. 再查詢「交通違規繳納記錄查詢」，逐頁擷取所有已繳納紀錄。
-5. CAPTCHA 圖片以 PIL.Image.Image 傳給：
+1. 未指定來源檔時，依序處理 Data\\高雄市.xlsx 與 Data\\桃園市.xlsx；
+   也可在命令列指定一個或多個 Excel。
+2. 每個 Excel 分別讀取統一編號／登記編號與登記名稱，並建立各自的
+   results\\<來源檔名>_違規明細查詢結果.xlsx。
+3. 使用 Playwright 先查詢「交通違規（含強制險）查詢及繳納」。
+4. 分別完整擷取「可線上繳納」與「不可線上繳納」的每一頁。
+5. 再查詢「交通違規繳納記錄查詢」，逐頁擷取所有已繳納紀錄。
+6. CAPTCHA 圖片以 PIL.Image.Image 傳給：
 
        from englishAlphanumericOcrApi import ocrImage
        code = ocrImage(image)
 
-6. 依網站 showbanner 驗證：
+7. 依網站 showbanner 驗證：
    - 實際走訪頁碼等於網站宣告總頁數。
    - 擷取筆數等於網站宣告總筆數。
    - 唯一資料筆數等於網站宣告總筆數。
    - 不得有同頁或跨頁重複擷取。
-7. 完整性不符時立即重爬同一家公司，不會直接處理下一家公司；
-   達重試上限後預設停止整批，避免把不完整結果標記為成功。
-8. Excel 主表新增三組分頁資訊、完整性檢查與重複資料檢查欄位。
-9. 公司明細工作表 A:G 保留原 155598 格式，H:N 註明每筆資料來源頁碼、
-   總頁數、網站宣告總筆數、分頁文字與資料唯一鍵。
-10. 新增「分頁完整性稽核」及「重複資料稽核」工作表。
-11. 所有未解決錯誤與分頁驗證失敗均寫入 results\\mvdis_errorLog 的 JSON。
-12. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；舊版未經分頁驗證的
+8. 完整性不符時立即重爬同一家公司，不會直接處理下一家公司；
+   達重試上限後預設停止目前來源檔，之後仍會接著處理下一個來源檔。
+9. Excel 主表新增三組分頁資訊、完整性檢查與重複資料檢查欄位。
+10. 公司明細工作表 A:G 保留原 155598 格式，H:N 註明每筆資料來源頁碼、
+    總頁數、網站宣告總筆數、分頁文字與資料唯一鍵。
+11. 新增「分頁完整性稽核」及「重複資料稽核」工作表。
+12. 所有未解決錯誤與分頁驗證失敗均寫入 results\\mvdis_errorLog 的 JSON。
+13. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；舊版未經分頁驗證的
     「成功」資料會自動重新查詢。
+14. 所有來源檔完成後，顯示高雄市與桃園市各自的結束狀態。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -106,9 +110,16 @@ except ImportError as exc:
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-# mvdisCrawl.py 位於 src 資料夾，因此從專案根目錄讀取：
+# mvdisCrawl.py 位於 src 資料夾，因此未指定來源檔時，依序處理：
 # Data\高雄市.xlsx
-DEFAULT_INPUT_PATH = PROJECT_ROOT / "Data" / "高雄市.xlsx"
+# Data\桃園市.xlsx
+DEFAULT_INPUT_PATHS = (
+    PROJECT_ROOT / "Data" / "高雄市.xlsx",
+    PROJECT_ROOT / "Data" / "桃園市.xlsx",
+)
+
+# 保留第一個預設路徑常數，供舊程式或外部 import 相容使用。
+DEFAULT_INPUT_PATH = DEFAULT_INPUT_PATHS[0]
 
 # 輸出資料夾放在專案根目錄下的 results。
 DEFAULT_RESULTS_DIR = PROJECT_ROOT / "results"
@@ -8673,7 +8684,7 @@ def restart_browser_session(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "依 Excel 統一編號先查交通違規（含強制險），"
+            "依一個或多個 Excel 的統一編號先查交通違規（含強制險），"
             "再查法人交通違規繳納記錄；"
             "兩階段均逐頁擷取，並以 showbanner 的總頁數／總筆數"
             "驗證完整性與重複資料。"
@@ -8681,13 +8692,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "input",
-        nargs="?",
+        "inputs",
+        nargs="*",
         type=Path,
-        default=DEFAULT_INPUT_PATH,
         help=(
-            "來源 Excel；預設為專案根目錄下的 "
-            r"Data\高雄市.xlsx"
+            "來源 Excel，可指定一個或多個檔案；省略時依序處理 "
+            r"Data\高雄市.xlsx、Data\桃園市.xlsx"
         ),
     )
     parser.add_argument(
@@ -8695,8 +8705,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "輸出 Excel；預設輸出到 results 資料夾，檔名為 "
+            "單一來源檔的輸出 Excel；同時處理多個來源時不可使用。"
+            "未指定時輸出為 <輸出資料夾>\\"
             "<來源檔名>_違規明細查詢結果.xlsx"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_RESULTS_DIR,
+        help=(
+            "多個來源檔共用的輸出資料夾；"
+            r"預設為專案根目錄下的 results"
         ),
     )
     parser.add_argument(
@@ -8844,13 +8864,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     return parser
 
-def main(
-    argv: Sequence[str] | None = None,
+def run_single_input(
+    args: argparse.Namespace,
+    input_path: Path,
+    file_index: int,
+    file_total: int,
 ) -> int:
-    args = build_parser().parse_args(argv)
+    """處理單一 Excel；由 main() 依序呼叫每一個來源檔。"""
+    input_path = input_path.expanduser().resolve()
+    results_dir = (
+        args.output_dir
+        .expanduser()
+        .resolve()
+    )
 
-    input_path = args.input.expanduser().resolve()
-    results_dir = DEFAULT_RESULTS_DIR.expanduser().resolve()
+    print()
+    print("=" * 88)
+    print(
+        f"[來源檔 {file_index}/{file_total}] "
+        f"{input_path}"
+    )
+    print("=" * 88)
 
     if not input_path.exists():
         raise SystemExit(f"找不到來源檔：{input_path}")
@@ -9634,9 +9668,214 @@ def main(
     )
     print(f"輸出檔：{output_path}")
     print(f"錯誤 JSON：{error_log_dir}")
+    print(
+        f"[來源檔 {file_index}/{file_total}] "
+        f"{input_path.name} 處理結束。"
+    )
 
     return 0 if errors == 0 else 2
 
+
+def resolve_input_paths(
+    values: Sequence[Path] | None,
+) -> list[Path]:
+    """
+    解析來源檔清單。
+
+    - 未指定位置參數：依序處理高雄市、桃園市。
+    - 指定位置參數：依使用者提供順序處理一個或多個 Excel。
+    - 相同絕對路徑只處理一次。
+    """
+    raw_values = (
+        list(values)
+        if values
+        else list(DEFAULT_INPUT_PATHS)
+    )
+
+    resolved: list[Path] = []
+    seen: set[str] = set()
+
+    for value in raw_values:
+        path = value.expanduser().resolve()
+        key = os.path.normcase(str(path))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        resolved.append(path)
+
+    return resolved
+
+
+def aggregate_file_exit_codes(
+    codes: Sequence[int],
+) -> int:
+    """彙整多個來源檔的執行結果，保留最重要的結束碼。"""
+    if any(code == 130 for code in codes):
+        return 130
+
+    if any(code == 3 for code in codes):
+        return 3
+
+    if any(code != 0 for code in codes):
+        return 2
+
+    return 0
+
+
+def main(
+    argv: Sequence[str] | None = None,
+) -> int:
+    args = build_parser().parse_args(argv)
+    input_paths = resolve_input_paths(
+        args.inputs
+    )
+
+    if not input_paths:
+        raise SystemExit(
+            "沒有任何來源 Excel 可處理"
+        )
+
+    if (
+        len(input_paths) > 1
+        and args.output is not None
+    ):
+        raise SystemExit(
+            "同時處理多個來源 Excel 時不可使用 --output；"
+            "請使用 --output-dir，程式會依來源檔名分別輸出。"
+        )
+
+    missing_paths = [
+        path
+        for path in input_paths
+        if not path.exists()
+    ]
+
+    if missing_paths:
+        missing_text = "\n".join(
+            f"- {path}"
+            for path in missing_paths
+        )
+        raise SystemExit(
+            "找不到以下來源檔：\n"
+            f"{missing_text}"
+        )
+
+    invalid_paths = [
+        path
+        for path in input_paths
+        if path.suffix.lower() != ".xlsx"
+    ]
+
+    if invalid_paths:
+        invalid_text = "\n".join(
+            f"- {path}"
+            for path in invalid_paths
+        )
+        raise SystemExit(
+            "目前只支援 .xlsx；以下檔案格式不符：\n"
+            f"{invalid_text}"
+        )
+
+    print(
+        "本次來源檔："
+        + "、".join(
+            path.name
+            for path in input_paths
+        )
+    )
+    print(
+        "每個來源檔會建立獨立輸出："
+        + "、".join(
+            (
+                f"{path.stem}_"
+                "違規明細查詢結果.xlsx"
+            )
+            for path in input_paths
+        )
+    )
+
+    results: list[
+        tuple[Path, int]
+    ] = []
+
+    for index, input_path in enumerate(
+        input_paths,
+        start=1,
+    ):
+        try:
+            code = run_single_input(
+                args=args,
+                input_path=input_path,
+                file_index=index,
+                file_total=len(input_paths),
+            )
+        except KeyboardInterrupt:
+            code = 130
+        except SystemExit as exc:
+            message = normalize_text(
+                exc.code
+            )
+
+            if message and not message.isdigit():
+                print(
+                    f"[{input_path.name}] 無法處理："
+                    f"{message}"
+                )
+
+            code = (
+                int(exc.code)
+                if isinstance(exc.code, int)
+                else 2
+            )
+        except Exception as exc:
+            print(
+                f"[{input_path.name}] 未預期錯誤："
+                f"{type(exc).__name__}: {exc}"
+            )
+            traceback.print_exc()
+            code = 2
+
+        results.append(
+            (
+                input_path,
+                code,
+            )
+        )
+
+        if code == 130:
+            break
+
+    print()
+    print("=" * 88)
+    print("全部來源檔執行摘要")
+    print("=" * 88)
+
+    for path, code in results:
+        status = (
+            "完成"
+            if code == 0
+            else (
+                "使用者中止"
+                if code == 130
+                else (
+                    "完整性錯誤"
+                    if code == 3
+                    else "有錯誤"
+                )
+            )
+        )
+        print(
+            f"- {path.name}：{status}（結束碼 {code}）"
+        )
+
+    return aggregate_file_exit_codes(
+        [
+            code
+            for _, code in results
+        ]
+    )
 
 
 if __name__ == "__main__":
