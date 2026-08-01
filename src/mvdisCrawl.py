@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: MULTI_CITY_INPUTS_PAGINATION_SCOPED_LINK_2026-08-01
+# VERSION: PAID_JSON_AUTHORITATIVE_PRESERVE_OPTIONAL_FIELDS_2026-08-01
 """
 監理服務網法人交通違規雙階段批次查詢工具。
 
@@ -32,6 +32,8 @@
 13. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；舊版未經分頁驗證的
     「成功」資料會自動重新查詢。
 14. 所有來源檔完成後，顯示高雄市與桃園市各自的結束狀態。
+15. 已繳納紀錄優先使用目前頁 hidden JSON，保留車號、日期、事由等
+    欄位空白或格式特殊的合法紀錄，不再因嚴格欄位條件漏抓。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -5389,10 +5391,18 @@ def select_paid_column_offset(
     row: Sequence[str],
     columns: dict[str, int],
 ) -> int:
+    """
+    找出已繳納資料列相對於表頭的欄位位移。
+
+    部分歷史資料的「繳費日期」或最前方勾選欄可能沒有輸出 td，
+    因此資料列可能比表頭少一至兩欄。舊版只檢查 -1～+2，遇到同時
+    缺少勾選欄與日期欄時會整列錯位並被捨棄；本版加入 -2。
+    """
     best_offset = 0
     best_score = -1
 
     for offset in (
+        -2,
         -1,
         0,
         1,
@@ -5422,6 +5432,12 @@ def select_paid_column_offset(
             offset,
         )
 
+        payment_method = shifted_row_value(
+            row,
+            columns["method"],
+            offset,
+        )
+
         amount = normalize_amount(
             shifted_row_value(
                 row,
@@ -5432,28 +5448,30 @@ def select_paid_column_offset(
 
         score = 0
 
-        if (
-            not payment_date
-            or is_roc_date_text(
-                payment_date
-            )
-        ):
-            score += 1
-
-        if re.fullmatch(
-            r"[A-Za-z0-9-]{5,24}",
-            ticket_number,
-        ):
+        if not payment_date:
+            score += 2
+        elif is_roc_date_text(payment_date):
+            score += 4
+        elif parse_result_datetime(payment_date) is not None:
             score += 3
 
-        if (
-            plate_number
-            and len(plate_number) <= 20
-        ):
+        if ticket_number:
+            score += 2
+
+            if re.fullmatch(
+                r"[A-Za-z0-9-]{4,40}",
+                ticket_number,
+            ):
+                score += 2
+
+        if plate_number:
             score += 2
 
         if reason:
             score += 2
+
+        if payment_method:
+            score += 1
 
         if amount not in ("", None):
             score += 2
@@ -5463,7 +5481,6 @@ def select_paid_column_offset(
             best_offset = offset
 
     return best_offset
-
 
 def select_unpaid_column_offset(
     row: Sequence[str],
@@ -5536,6 +5553,13 @@ def canonicalize_paid_row(
     row: Sequence[str],
     columns: dict[str, int],
 ) -> list[Any] | None:
+    """
+    將畫面上的已繳納資料列轉成來源 Excel 的 A:G 結構。
+
+    車號、繳費日期、事由或繳納方式在部分歷史資料可能為空白；網站仍
+    將它們計入 showbanner 的總筆數。這些欄位不得再被視為整列無效。
+    只要正式結果表中的資料列至少含有一個有效資料欄位，就保留該列。
+    """
     offset = select_paid_column_offset(
         row,
         columns,
@@ -5579,43 +5603,91 @@ def canonicalize_paid_row(
         )
     )
 
-    if (
-        compact_header_text(payment_date)
-        in {
+    compact_values = {
+        compact_header_text(value)
+        for value in row
+        if normalize_text(value)
+    }
+
+    if compact_values.intersection(
+        {
             "繳費日期",
             "繳納日期",
+            "單號",
+            "舉發單號",
+            "車號",
+            "車牌",
+            "車牌號碼",
+            "事由",
+            "違規事由",
+            "繳納方式",
+            "繳費方式",
+            "罰鍰",
+            "罰款",
+            "金額",
         }
-    ):
-        return None
-
-    # 來源檔中有少數繳費日期空白的紀錄，
-    # 因此以單號、車號、事由及罰鍰判斷資料列。
-    if not (
-        ticket_number
-        and plate_number
-        and reason
-        and fine not in ("", None)
-    ):
-        return None
-
-    if (
-        payment_date
-        and not is_roc_date_text(
-            payment_date
+    ) and sum(
+        value in compact_values
+        for value in (
+            "繳費日期",
+            "繳納日期",
+            "單號",
+            "舉發單號",
+            "車號",
+            "車牌",
+            "事由",
+            "違規事由",
+            "罰鍰",
+            "金額",
         )
-    ):
+    ) >= 2:
         return None
 
-    return [
-        None,
-        payment_date or None,
+    meaningful_values = [
+        payment_date,
         ticket_number,
         plate_number,
         reason,
-        payment_method or None,
-        fine,
+        payment_method,
+        (
+            fine
+            if fine not in ("", None)
+            else ""
+        ),
     ]
 
+    if not any(
+        normalize_text(value)
+        for value in meaningful_values
+    ):
+        return None
+
+    normalized_payment_date = payment_date
+
+    if (
+        payment_date
+        and not is_roc_date_text(payment_date)
+    ):
+        converted_date = format_roc_date(
+            payment_date
+        )
+
+        if is_roc_date_text(converted_date):
+            normalized_payment_date = converted_date
+
+    return [
+        None,
+        normalized_payment_date or None,
+        ticket_number or None,
+        plate_number or None,
+        reason or None,
+        payment_method or None,
+        (
+            fine
+            if fine not in ("", None)
+            else None
+        ),
+    ]
 
 def canonicalize_unpaid_row(
     row: Sequence[str],
@@ -5893,7 +5965,13 @@ def first_present_value(
 def build_paid_table_from_json_payload(
     payload: Any,
 ) -> ExtractedTable | None:
-    """將目前頁面的 hidden JSON 轉成來源 155598 的 A:G 結構。"""
+    """
+    將目前頁面的 hidden JSON 轉成來源 155598 的 A:G 結構。
+
+    hidden JSON 是網站用來產生目前頁表格的結構化資料。舊版要求單號、
+    車號、事由與罰鍰四欄全部非空，導致網站仍計入總筆數的歷史紀錄被
+    靜默捨棄。本版只排除完全空白的物件，其餘欄位均按原值保留。
+    """
     records: Any = payload
 
     if isinstance(records, dict):
@@ -5984,11 +6062,75 @@ def build_paid_table_from_json_payload(
             )
         )
 
-        if not (
-            ticket_number
-            and plate_number
-            and reason
-            and fine not in ("", None)
+        violation_date = normalize_text(
+            first_present_value(
+                raw_record,
+                (
+                    "vilDateStr",
+                    "vilDate",
+                    "violationDate",
+                ),
+            )
+        )
+        arrived_date = normalize_text(
+            first_present_value(
+                raw_record,
+                (
+                    "arrivedDateStr",
+                    "arrivedDate",
+                    "dueDate",
+                ),
+            )
+        )
+        update_dmv = normalize_text(
+            first_present_value(
+                raw_record,
+                (
+                    "updateDmv",
+                    "dmv",
+                    "office",
+                ),
+            )
+        )
+        close_no = normalize_text(
+            first_present_value(
+                raw_record,
+                (
+                    "closeNo",
+                    "closeNumber",
+                ),
+            )
+        )
+        sequence_value = first_present_value(
+            raw_record,
+            (
+                "items",
+                "item",
+                "rowNo",
+                "sequence",
+                "index",
+            ),
+        )
+
+        meaningful_values = [
+            payment_date_value,
+            ticket_number,
+            plate_number,
+            reason,
+            payment_method,
+            (
+                fine
+                if fine not in ("", None)
+                else ""
+            ),
+            violation_date,
+            arrived_date,
+            sequence_value,
+        ]
+
+        if not any(
+            normalize_text(value)
+            for value in meaningful_values
         ):
             continue
 
@@ -5998,25 +6140,44 @@ def build_paid_table_from_json_payload(
         canonical = [
             None,
             payment_date or None,
-            ticket_number,
-            plate_number,
-            reason,
+            ticket_number or None,
+            plate_number or None,
+            reason or None,
             payment_method or None,
-            fine,
+            (
+                fine
+                if fine not in ("", None)
+                else None
+            ),
         ]
         canonical_rows.append(canonical)
 
-        # 單號是已繳紀錄的主要識別欄位；仍將其他欄位納入，避免網站重用單號時誤判。
+        identity_values = [
+            ticket_number,
+            plate_number,
+            payment_date,
+            reason,
+            payment_method,
+            fine,
+            violation_date,
+            arrived_date,
+            update_dmv,
+            close_no,
+        ]
+
+        # 正常情況不把頁面流水號 items 放入唯一鍵，才能偵測伺服器重複
+        # 回傳同一筆資料；只有其他識別欄位全部空白時才以流水號兜底。
+        if not any(
+            normalize_text(value)
+            for value in identity_values
+        ):
+            identity_values.append(
+                sequence_value
+            )
+
         row_keys.append(
             record_fingerprint(
-                [
-                    ticket_number,
-                    plate_number,
-                    payment_date,
-                    reason,
-                    payment_method,
-                    fine,
-                ]
+                identity_values
             )
         )
 
@@ -6025,7 +6186,7 @@ def build_paid_table_from_json_payload(
 
     return ExtractedTable(
         kind=TABLE_KIND_PAID,
-        title="罰鍰繳納紀錄",
+        title="罰鍰繳納紀錄（hidden JSON）",
         headers=[
             "",
             "繳費日期",
@@ -6638,10 +6799,20 @@ def extract_paid_page_tables(
     """
     擷取第二階段目前頁面的資料。
 
-    優先使用畫面上目前頁的表格，因為 hidden JSON 不保證包含全部頁，
-    也不保證能正確反映目前頁碼。只有畫面表格無法解析時，才使用
-    hidden JSON 作為同一頁的備援。
+    優先採用目前頁面的 hidden JSON，因為它是網站產生畫面表格時使用
+    的結構化紀錄，能保留空白車號、空白日期或格式特殊的歷史資料。
+    同時解析畫面表格作為交叉檢查與備援：
+
+    - JSON 筆數不少於畫面解析筆數，且沒有超出單頁合理容量：採 JSON。
+    - JSON 不合理或不存在：採畫面表格。
+    - 畫面表格解析不到，但 JSON 合理：採 JSON。
+
+    這可修正 90715837 的 16 頁均正確到達、卻只擷取 140/156 筆的問題。
     """
+    json_input_found, paid_json_table = (
+        extract_paid_table_from_hidden_json(page)
+    )
+
     visible_tables = extract_visible_tables_with_retry(
         page,
         timeout_ms,
@@ -6652,18 +6823,73 @@ def extract_paid_page_tables(
         if table.kind == TABLE_KIND_PAID
     ]
 
+    visible_count = sum(
+        table.record_count
+        for table in paid_visible
+    )
+    json_count = (
+        paid_json_table.record_count
+        if paid_json_table is not None
+        else 0
+    )
+
+    pagination_info: PaginationInfo | None = None
+
+    try:
+        pagination_info = read_pagination_info(
+            page,
+            PAID_PAGINATION_BANNER_XPATH,
+            QUERY_SECTION_PAID,
+            PAID_RECORD_CATEGORY,
+        )
+    except DataIntegrityError:
+        pagination_info = None
+
+    json_is_page_scoped = True
+
+    if (
+        paid_json_table is not None
+        and pagination_info is not None
+        and pagination_info.total_pages > 1
+    ):
+        # 每頁容量至少為向上取整後的平均值。若 JSON 筆數大於網站總筆數
+        # 或明顯大於合理單頁容量，可能是「全部頁」payload，不可逐頁重複用。
+        average_ceiling = (
+            pagination_info.declared_total_records
+            + pagination_info.total_pages
+            - 1
+        ) // pagination_info.total_pages
+        reasonable_page_limit = max(
+            average_ceiling * 2,
+            10,
+        )
+        json_is_page_scoped = (
+            json_count
+            <= pagination_info.declared_total_records
+            and json_count <= reasonable_page_limit
+        )
+
+    if (
+        paid_json_table is not None
+        and json_is_page_scoped
+        and (
+            not paid_visible
+            or json_count >= visible_count
+        )
+    ):
+        return [paid_json_table]
+
     if paid_visible:
         return paid_visible
 
-    json_input_found, paid_json_table = (
-        extract_paid_table_from_hidden_json(page)
-    )
-
-    if json_input_found and paid_json_table is not None:
+    if (
+        json_input_found
+        and paid_json_table is not None
+        and json_is_page_scoped
+    ):
         return [paid_json_table]
 
     return []
-
 
 def collect_all_result_pages(
     page: Page,
