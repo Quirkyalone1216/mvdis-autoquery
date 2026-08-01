@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: PAID_JSON_AUTHORITATIVE_PRESERVE_OPTIONAL_FIELDS_2026-08-01
+# VERSION: UNPAID_OPTIONAL_FIELDS_CONTINUE_AFTER_RECORD_ERROR_2026-08-02
 """
 監理服務網法人交通違規雙階段批次查詢工具。
 
@@ -22,8 +22,8 @@
    - 擷取筆數等於網站宣告總筆數。
    - 唯一資料筆數等於網站宣告總筆數。
    - 不得有同頁或跨頁重複擷取。
-8. 完整性不符時立即重爬同一家公司，不會直接處理下一家公司；
-   達重試上限後預設停止目前來源檔，之後仍會接著處理下一個來源檔。
+8. 完整性不符時立即重爬同一家公司；達重試上限後會把該公司標成錯誤、
+   保存 JSON／Excel，然後繼續下一家公司，不會因單筆錯誤中斷整批。
 9. Excel 主表新增三組分頁資訊、完整性檢查與重複資料檢查欄位。
 10. 公司明細工作表 A:G 保留原 155598 格式，H:N 註明每筆資料來源頁碼、
     總頁數、網站宣告總筆數、分頁文字與資料唯一鍵。
@@ -34,6 +34,10 @@
 14. 所有來源檔完成後，顯示高雄市與桃園市各自的結束狀態。
 15. 已繳納紀錄優先使用目前頁 hidden JSON，保留車號、日期、事由等
     欄位空白或格式特殊的合法紀錄，不再因嚴格欄位條件漏抓。
+16. 未繳／不可線上繳納紀錄也允許事由、罰鍰、應到案日等選填欄位空白；
+    會利用列內的「罰鍰明細資訊」補抓日期、罰鍰與識別資料。
+17. 單一公司經完整性重試仍失敗時預設繼續處理後續公司；只有明確指定
+    --stop-on-integrity-error 才會在該來源檔停止。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -406,7 +410,7 @@ class TransientPageError(RuntimeError):
 
 
 class DataIntegrityError(RuntimeError):
-    """分頁、筆數或重複資料驗證失敗；不得直接處理下一家公司。"""
+    """分頁、筆數或重複資料驗證失敗；該筆不得標記為成功。"""
 
     def __init__(
         self,
@@ -5402,7 +5406,6 @@ def select_paid_column_offset(
     best_score = -1
 
     for offset in (
-        -2,
         -1,
         0,
         1,
@@ -5486,10 +5489,22 @@ def select_unpaid_column_offset(
     row: Sequence[str],
     columns: dict[str, int],
 ) -> int:
+    """
+    找出未繳／不可線上繳納資料列相對於表頭的欄位位移。
+
+    部分舊案件會省略事由或其他 td；因此不能因 reason 空白就把整列
+    判定無效。評分以日期、罰鍰、應到案日及明細區識別文字為主。
+    """
     best_offset = 0
     best_score = -1
 
+    combined = " ".join(
+        normalize_text(value)
+        for value in row
+    )
+
     for offset in (
+        -2,
         -1,
         0,
         1,
@@ -5526,28 +5541,39 @@ def select_unpaid_column_offset(
         if is_roc_date_text(
             violation_date
         ):
+            score += 6
+        elif parse_result_datetime(
+            violation_date
+        ) is not None:
             score += 4
+        elif not violation_date:
+            score += 1
 
+        # 事由是網站可能合法留白的欄位，只作加分，不作必要條件。
         if reason:
             score += 2
 
         if amount not in ("", None):
+            score += 3
+
+        if is_roc_date_text(
+            due_date
+        ):
+            score += 3
+        elif not due_date:
+            score += 1
+
+        if "罰鍰明細資訊" in combined:
             score += 2
 
-        if (
-            not due_date
-            or is_roc_date_text(
-                due_date
-            )
-        ):
-            score += 2
+        if "告發單號" in combined:
+            score += 1
 
         if score > best_score:
             best_score = score
             best_offset = offset
 
     return best_offset
-
 
 def canonicalize_paid_row(
     row: Sequence[str],
@@ -5689,10 +5715,109 @@ def canonicalize_paid_row(
         ),
     ]
 
+def extract_roc_date_after_label(
+    text: str,
+    label: str,
+) -> str:
+    """從列內罰鍰明細文字抓取民國日期。"""
+    match = re.search(
+        rf"{re.escape(label)}\s*"
+        r"(\d{2,3}\s*年\s*"
+        r"\d{1,2}\s*月\s*"
+        r"\d{1,2}\s*日)",
+        normalize_text(text),
+    )
+
+    return (
+        normalize_text(match.group(1))
+        if match
+        else ""
+    )
+
+
+def extract_unpaid_reason_from_detail(
+    text: str,
+) -> str:
+    """
+    從「罰鍰明細資訊」的事由欄抓值。
+
+    合法歷史案件的事由可能真的為空白；空白時回傳空字串，但不會因此
+    刪除整筆資料。
+    """
+    normalized = normalize_text(text)
+    marker = normalized.find(
+        "罰鍰明細資訊"
+    )
+
+    if marker >= 0:
+        normalized = normalized[
+            marker:
+        ]
+
+    match = re.search(
+        r"事由\s*(.*?)\s*"
+        r"(?=違規地點|歸責對象|告發單號|車號|"
+        r"違反法規及法條|到案處所|應到案日|罰鍰金額|$)",
+        normalized,
+    )
+
+    return (
+        normalize_text(match.group(1))
+        if match
+        else ""
+    )
+
+
+def extract_unpaid_fine_from_detail(
+    text: str,
+) -> int | str:
+    """從列內罰鍰明細抓取罰鍰金額。"""
+    match = re.search(
+        r"罰鍰金額\s*([\d,，]+)\s*元?",
+        normalize_text(text),
+    )
+
+    if not match:
+        return ""
+
+    return normalize_amount(
+        match.group(1)
+    )
+
+
+def unpaid_detail_identity_present(
+    text: str,
+) -> bool:
+    """判斷列內是否帶有網站正式案件明細識別資料。"""
+    normalized = normalize_text(text)
+
+    return any(
+        marker in normalized
+        for marker in (
+            "罰鍰明細資訊",
+            "告發單號",
+            "違規地點",
+            "歸責對象",
+            "到案處所",
+            "罰鍰金額",
+        )
+    )
+
+
 def canonicalize_unpaid_row(
     row: Sequence[str],
     columns: dict[str, int],
 ) -> list[Any] | None:
+    """
+    將未繳／不可線上繳納資料列轉成來源 Excel 的 A:G 結構。
+
+    修正重點：
+    - 「事由」在部分歷史案件會是空白，例如 94125622 第 7 頁其中一筆；
+      舊版要求 date + reason + fine 全部存在，因此該筆被靜默捨棄。
+    - 罰鍰或應到案日也可能因網站欄位輸出差異而空白，不可因此刪除。
+    - 只要正式結果列具有日期、金額、應到案日或案件明細識別資料之一，
+      就保留該筆；完整性檢查仍會要求最後總筆數等於網站宣告筆數。
+    """
     offset = select_unpaid_column_offset(
         row,
         columns,
@@ -5724,65 +5849,192 @@ def canonicalize_unpaid_row(
         offset,
     )
 
-    if (
-        compact_header_text(
-            violation_date
+    # 欄位錯位時，某一格可能整段帶入「罰鍰明細資訊」；這不是該欄
+    # 的真實值，先清空，稍後再從標籤式明細中精確補回。
+    if reason and any(
+        marker in reason
+        for marker in (
+            "罰鍰明細資訊",
+            "告發單號",
+            "罰鍰金額",
         )
-        in {
-            "違規日",
-            "違規日期",
-        }
     ):
-        return None
+        reason = ""
 
-    if not (
-        is_roc_date_text(
-            violation_date
+    if isinstance(fine, str):
+        compact_fine = re.sub(
+            r"[,，\s元]",
+            "",
+            fine,
         )
-        and reason
-        and fine not in ("", None)
-    ):
-        return None
 
-    if (
-        due_date
-        and not is_roc_date_text(
-            due_date
+        if not re.fullmatch(
+            r"-?\d+",
+            compact_fine,
+        ):
+            fine = ""
+
+    if due_date and any(
+        marker in due_date
+        for marker in (
+            "罰鍰明細資訊",
+            "告發單號",
+            "罰鍰金額",
         )
     ):
-        return None
+        due_date = ""
 
     combined = " ".join(
         normalize_text(value)
         for value in row
     )
 
-    status = (
-        "需到案"
-        if "需到案" in combined
-        else None
+    compact_values = {
+        compact_header_text(value)
+        for value in row
+        if normalize_text(value)
+    }
+
+    header_hits = sum(
+        value in compact_values
+        for value in (
+            "原因",
+            "違規日",
+            "違規日期",
+            "事由",
+            "違規事由",
+            "罰鍰",
+            "罰款",
+            "金額",
+            "應到案日",
+            "應到案日期",
+        )
     )
 
-    view_text = next(
-        (
-            normalize_text(value)
-            for value in row
-            if "檢視" in normalize_text(
-                value
+    if header_hits >= 3:
+        return None
+
+    if contains_any(
+        combined,
+        NO_DATA_PATTERNS,
+    ):
+        return None
+
+    # 表格主欄位空白時，從同一列內嵌的「罰鍰明細資訊」補回資料。
+    if not is_roc_date_text(
+        violation_date
+    ):
+        recovered_date = extract_roc_date_after_label(
+            combined,
+            "違規日",
+        )
+
+        if recovered_date:
+            violation_date = recovered_date
+        elif violation_date:
+            converted_date = format_roc_date(
+                violation_date
             )
-        ),
-        "檢視",
+
+            if converted_date:
+                violation_date = converted_date
+
+    if not reason:
+        reason = extract_unpaid_reason_from_detail(
+            combined
+        )
+
+    if fine in ("", None):
+        recovered_fine = extract_unpaid_fine_from_detail(
+            combined
+        )
+
+        if recovered_fine not in ("", None):
+            fine = recovered_fine
+
+    if not is_roc_date_text(
+        due_date
+    ):
+        recovered_due_date = extract_roc_date_after_label(
+            combined,
+            "應到案日",
+        )
+
+        if recovered_due_date:
+            due_date = recovered_due_date
+        elif due_date:
+            converted_due_date = format_roc_date(
+                due_date
+            )
+
+            if converted_due_date:
+                due_date = converted_due_date
+
+    detail_identity = unpaid_detail_identity_present(
+        combined
+    )
+
+    meaningful_record = any(
+        (
+            is_roc_date_text(
+                violation_date
+            ),
+            bool(reason),
+            fine not in ("", None),
+            is_roc_date_text(
+                due_date
+            ),
+            detail_identity,
+        )
+    )
+
+    if not meaningful_record:
+        return None
+
+    raw_status = row_value(
+        row,
+        0,
+    )
+
+    status = (
+        raw_status
+        if (
+            raw_status
+            and len(raw_status) <= 24
+            and compact_header_text(
+                raw_status
+            ) not in {
+                "原因",
+                "狀態",
+            }
+        )
+        else (
+            "需到案"
+            if "需到案" in combined
+            else None
+        )
+    )
+
+    view_text = (
+        "檢視"
+        if "檢視" in combined
+        else None
     )
 
     return [
         status,
-        violation_date,
-        reason,
-        fine,
+        violation_date or None,
+        reason or None,
+        (
+            fine
+            if fine not in ("", None)
+            else None
+        ),
         due_date or None,
-        view_text,
+        view_text or "檢視",
         None,
     ]
+
 
 ENGLISH_MONTH_NUMBERS = {
     "jan": 1,
@@ -9042,10 +9294,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stop-on-integrity-error",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "完整性驗證連續失敗達上限後停止整批，不處理下一家公司；"
-            "預設啟用"
+            "完整性驗證連續失敗達上限後是否停止目前來源檔；"
+            "預設停用，會記錄該公司錯誤並繼續下一家公司"
         ),
     )
     parser.add_argument(
@@ -9305,7 +9557,7 @@ def run_single_input(
         "完整性失敗策略：同一家公司立即重爬 "
         f"{args.max_integrity_attempts} 次；"
         f"達上限後"
-        f"{'停止整批' if args.stop_on_integrity_error else '記錄錯誤後繼續'}。"
+        f"{'停止目前來源檔' if args.stop_on_integrity_error else '保存錯誤並繼續下一家公司'}。"
     )
     print(
         "瀏覽器失效策略：自動重建 Page／Context／Browser，"
@@ -9861,12 +10113,23 @@ def run_single_input(
 
                 if stop_after_current:
                     print(
-                        "完整性驗證已達重試上限。"
-                        "依預設設定停止整批，沒有處理下一家公司。"
+                        "完整性驗證已達重試上限；"
+                        "因明確指定 --stop-on-integrity-error，"
+                        "停止目前來源檔。"
                     )
                     print(f"輸出檔：{output_path}")
                     print(f"錯誤 JSON：{error_log_dir}")
                     return 3
+
+                if (
+                    outcome.status != STATUS_SUCCESS
+                    and work_queue
+                ):
+                    print(
+                        "  本筆問題已保存到 Excel／JSON；"
+                        "不會中斷流程，繼續處理下一家公司。",
+                        flush=True,
+                    )
 
                 if work_queue:
                     time.sleep(
