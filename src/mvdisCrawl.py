@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: UNPAID_OPTIONAL_FIELDS_CONTINUE_AFTER_RECORD_ERROR_2026-08-02
+# VERSION: SELECTIVE_RESUME_REPAIR_INCOMPLETE_ROWS_2026-08-06
 """
 監理服務網法人交通違規雙階段批次查詢工具。
 
@@ -29,8 +29,8 @@
     總頁數、網站宣告總筆數、分頁文字與資料唯一鍵。
 11. 新增「分頁完整性稽核」及「重複資料稽核」工作表。
 12. 所有未解決錯誤與分頁驗證失敗均寫入 results\\mvdis_errorLog 的 JSON。
-13. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；舊版未經分頁驗證的
-    「成功」資料會自動重新查詢。
+13. 永遠寫入輸出 Excel，支援逐筆儲存與中斷續跑；既有輸出檔會逐筆執行
+    主表、三組分頁稽核、重複稽核、明細工作表與唯一鍵交叉驗證。
 14. 所有來源檔完成後，顯示高雄市與桃園市各自的結束狀態。
 15. 已繳納紀錄優先使用目前頁 hidden JSON，保留車號、日期、事由等
     欄位空白或格式特殊的合法紀錄，不再因嚴格欄位條件漏抓。
@@ -38,6 +38,8 @@
     會利用列內的「罰鍰明細資訊」補抓日期、罰鍰與識別資料。
 17. 單一公司經完整性重試仍失敗時預設繼續處理後續公司；只有明確指定
     --stop-on-integrity-error 才會在該來源檔停止。
+18. results/<來源檔名>_違規明細查詢結果.xlsx 已存在時，預設只把未通過
+    交叉驗證的公司列放入查詢佇列；已確認完整的公司不會再次連線查詢。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -399,6 +401,15 @@ class QueryOutcome:
     retry_later: bool = False
     page_audits: list[PageAudit] = field(default_factory=list)
     duplicate_keys: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ResumeInspection:
+    """既有輸出檔中單一公司列的續跑完整性稽核結果。"""
+
+    complete: bool
+    reason: str
+    record_count: int | None = None
 
 
 class CaptchaRecognitionError(RuntimeError):
@@ -8807,21 +8818,455 @@ def perform_paid_record_query(
         retry_later=True,
     )
 
-def should_skip_row(
+RESUME_EXPECTED_GROUPS: tuple[tuple[str, str, str], ...] = (
+    (
+        QUERY_SECTION_CURRENT,
+        CURRENT_ONLINE_CATEGORY,
+        "可線上繳納分頁資訊",
+    ),
+    (
+        QUERY_SECTION_CURRENT,
+        CURRENT_OFFLINE_CATEGORY,
+        "不可線上繳納分頁資訊",
+    ),
+    (
+        QUERY_SECTION_PAID,
+        PAID_RECORD_CATEGORY,
+        "繳納紀錄分頁資訊",
+    ),
+)
+
+PAGINATION_SUMMARY_PATTERN = re.compile(
+    r"^(?P<total_pages>\d+)\s*頁，共\s*"
+    r"(?P<declared_total_records>\d+)\s*筆資料；"
+    r"已擷取\s*(?P<extracted_count>\d+)\s*筆；"
+    r"唯一\s*(?P<unique_count>\d+)\s*筆；"
+    r"重複\s*(?P<duplicate_count>\d+)\s*筆$"
+)
+
+DETAIL_METADATA_PREFIXES = (
+    "查詢階段：",
+    "資料分類：",
+    "擷取頁碼：",
+    "總頁數：",
+    "網站宣告總筆數：",
+    "分頁資訊：",
+    "資料唯一鍵：",
+)
+
+
+def parse_nonnegative_int(value: Any) -> int | None:
+    """將 Excel 數值安全轉成非負整數；布林值與小數不接受。"""
+    if isinstance(value, bool) or value is None:
+        return None
+
+    if isinstance(value, int):
+        return value if value >= 0 else None
+
+    if isinstance(value, float):
+        if not value.is_integer() or value < 0:
+            return None
+        return int(value)
+
+    text = normalize_text(value)
+    if not re.fullmatch(r"\d+", text):
+        return None
+
+    return int(text)
+
+
+def parse_pagination_summary(value: Any) -> dict[str, int] | None:
+    """解析主表的「N 頁，共 M 筆；已擷取…」摘要。"""
+    match = PAGINATION_SUMMARY_PATTERN.fullmatch(
+        normalize_text(value)
+    )
+
+    if match is None:
+        return None
+
+    return {
+        key: int(raw_value)
+        for key, raw_value in match.groupdict().items()
+    }
+
+
+def normalized_audit_company_id(value: Any) -> str:
+    """統一稽核表中的統一編號格式，避免 Excel 去除前導零。"""
+    try:
+        _, query_id = normalize_company_id(value)
+        return query_id
+    except (TypeError, ValueError):
+        return ""
+
+
+def extract_prefixed_text(value: Any, prefix: str) -> str | None:
+    text = normalize_text(value)
+    if not text.startswith(prefix):
+        return None
+    return normalize_text(text[len(prefix):])
+
+
+def inspect_pagination_audit_rows(
+    pagination_sheet: Any,
+    duplicate_sheet: Any,
+    company: CompanyRow,
+    summaries: dict[tuple[str, str], dict[str, int]],
+) -> str | None:
+    """交叉檢查該公司在兩張稽核工作表中的資料；成功回傳 None。"""
+    company_rows: list[dict[str, Any]] = []
+
+    for row in range(2, pagination_sheet.max_row + 1):
+        if normalized_audit_company_id(
+            pagination_sheet.cell(row, 3).value
+        ) != company.query_id:
+            continue
+
+        section = normalize_text(
+            pagination_sheet.cell(row, 5).value
+        )
+        category = normalize_text(
+            pagination_sheet.cell(row, 6).value
+        )
+        numeric_values = [
+            parse_nonnegative_int(
+                pagination_sheet.cell(row, column).value
+            )
+            for column in range(7, 16)
+        ]
+
+        if any(value is None for value in numeric_values):
+            return (
+                f"分頁完整性稽核第 {row} 列含有無法解析的數值"
+            )
+
+        company_rows.append(
+            {
+                "row": row,
+                "section": section,
+                "category": category,
+                "page_number": numeric_values[0],
+                "total_pages": numeric_values[1],
+                "declared_total_records": numeric_values[2],
+                "page_extracted_count": numeric_values[3],
+                "page_unique_count": numeric_values[4],
+                "page_duplicate_count": numeric_values[5],
+                "group_extracted_count": numeric_values[6],
+                "group_unique_count": numeric_values[7],
+                "group_duplicate_count": numeric_values[8],
+                "result": normalize_text(
+                    pagination_sheet.cell(row, 17).value
+                ),
+            }
+        )
+
+    if not company_rows:
+        return "分頁完整性稽核工作表沒有該公司的紀錄"
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = (
+        defaultdict(list)
+    )
+
+    for item in company_rows:
+        key = (item["section"], item["category"])
+        if key not in summaries:
+            return (
+                "分頁完整性稽核出現非預期分類："
+                f"{item['section']}／{item['category']}"
+            )
+        grouped[key].append(item)
+
+    if set(grouped) != set(summaries):
+        missing = set(summaries) - set(grouped)
+        missing_text = "、".join(
+            f"{section}／{category}"
+            for section, category in sorted(missing)
+        )
+        return f"分頁完整性稽核缺少分類：{missing_text}"
+
+    for key, summary in summaries.items():
+        items = grouped[key]
+        total_pages = summary["total_pages"]
+        declared = summary["declared_total_records"]
+        expected_pages = set(range(1, total_pages + 1))
+        actual_pages = {
+            int(item["page_number"])
+            for item in items
+        }
+
+        if actual_pages != expected_pages:
+            return (
+                f"分頁完整性稽核頁碼不完整：{key[0]}／{key[1]}；"
+                f"預期={sorted(expected_pages)}；實際={sorted(actual_pages)}"
+            )
+
+        if len(items) != total_pages:
+            return (
+                f"分頁完整性稽核頁數重複或缺漏：{key[0]}／{key[1]}；"
+                f"應有 {total_pages} 列，實際 {len(items)} 列"
+            )
+
+        for item in items:
+            if item["result"] != "通過":
+                return (
+                    f"分頁完整性稽核未通過：{key[0]}／{key[1]}，"
+                    f"Excel 第 {item['row']} 列"
+                )
+
+            if (
+                item["total_pages"] != total_pages
+                or item["declared_total_records"] != declared
+                or item["group_extracted_count"]
+                != summary["extracted_count"]
+                or item["group_unique_count"]
+                != summary["unique_count"]
+                or item["group_duplicate_count"]
+                != summary["duplicate_count"]
+            ):
+                return (
+                    "主表與分頁完整性稽核數值不一致："
+                    f"{key[0]}／{key[1]}"
+                )
+
+        page_extracted_total = sum(
+            int(item["page_extracted_count"])
+            for item in items
+        )
+        page_unique_total = sum(
+            int(item["page_unique_count"])
+            for item in items
+        )
+        page_duplicate_total = sum(
+            int(item["page_duplicate_count"])
+            for item in items
+        )
+
+        if (
+            page_extracted_total != declared
+            or page_unique_total != declared
+            or page_duplicate_total != 0
+        ):
+            return (
+                "分頁完整性稽核的逐頁合計不正確："
+                f"{key[0]}／{key[1]}；"
+                f"擷取={page_extracted_total}；唯一={page_unique_total}；"
+                f"重複={page_duplicate_total}；網站={declared}"
+            )
+
+    for row in range(2, duplicate_sheet.max_row + 1):
+        if normalized_audit_company_id(
+            duplicate_sheet.cell(row, 3).value
+        ) == company.query_id:
+            return (
+                "重複資料稽核工作表仍存在該公司的重複紀錄："
+                f"第 {row} 列"
+            )
+
+    return None
+
+
+def inspect_detail_sheet(
+    workbook: Any,
+    company: CompanyRow,
+    record_count: int,
+    summaries: dict[tuple[str, str], dict[str, int]],
+) -> str | None:
+    """檢查明細 A:G 與 H:N metadata 是否和主表及分頁摘要一致。"""
+    expected_title = detail_sheet_name(
+        company.raw_id,
+        company.query_id,
+    )
+    candidate_titles = {
+        safe_sheet_name(company.raw_id),
+        safe_sheet_name(company.query_id),
+        expected_title,
+    }
+    candidate_titles.discard(DETAIL_TEMPLATE_SHEET_NAME)
+    existing_titles = sorted(
+        title
+        for title in candidate_titles
+        if title in workbook.sheetnames
+    )
+
+    if record_count == 0:
+        for title in existing_titles:
+            detail_sheet = workbook[title]
+            has_stale_data = any(
+                normalize_text(
+                    detail_sheet.cell(row, column).value
+                )
+                for row in range(1, detail_sheet.max_row + 1)
+                for column in range(1, 15)
+            )
+            if has_stale_data:
+                return (
+                    "主表為 0 筆，但仍存在非空白公司明細工作表："
+                    f"{title}"
+                )
+        return None
+
+    if expected_title not in workbook.sheetnames:
+        return f"主表為 {record_count} 筆，但缺少明細工作表 {expected_title}"
+
+    extra_titles = [
+        title
+        for title in existing_titles
+        if title != expected_title
+    ]
+    if extra_titles:
+        return (
+            "同一家公司存在多個舊版明細工作表，無法確認資料唯一性："
+            + "、".join(extra_titles + [expected_title])
+        )
+
+    detail_sheet = workbook[expected_title]
+
+    if detail_sheet.max_column < DETAIL_AUDIT_LAST_COLUMN:
+        return (
+            f"明細工作表 {expected_title} 缺少 H:N 來源稽核欄位"
+        )
+
+    group_counts: Counter[tuple[str, str]] = Counter()
+    group_keys: dict[tuple[str, str], set[str]] = defaultdict(set)
+    data_row_count = 0
+
+    for row in range(1, detail_sheet.max_row + 1):
+        data_present = any(
+            normalize_text(
+                detail_sheet.cell(row, column).value
+            )
+            for column in range(1, 8)
+        )
+        metadata_present = any(
+            normalize_text(
+                detail_sheet.cell(row, column).value
+            )
+            for column in range(8, 15)
+        )
+
+        if not data_present and not metadata_present:
+            continue
+
+        if not data_present:
+            return f"明細工作表第 {row} 列只有 metadata，沒有 A:G 資料"
+
+        if not metadata_present:
+            return f"明細工作表第 {row} 列有資料，但缺少 H:N metadata"
+
+        raw_metadata = [
+            detail_sheet.cell(row, column).value
+            for column in range(8, 15)
+        ]
+        parsed_metadata = [
+            extract_prefixed_text(value, prefix)
+            for value, prefix in zip(
+                raw_metadata,
+                DETAIL_METADATA_PREFIXES,
+            )
+        ]
+
+        if any(value is None for value in parsed_metadata):
+            return (
+                f"明細工作表第 {row} 列 H:N metadata 格式不完整"
+            )
+
+        section = parsed_metadata[0] or ""
+        category = parsed_metadata[1] or ""
+        key = (section, category)
+
+        if key not in summaries:
+            return (
+                f"明細工作表第 {row} 列分類不正確："
+                f"{section}／{category}"
+            )
+
+        page_number = parse_nonnegative_int(parsed_metadata[2])
+        total_pages = parse_nonnegative_int(parsed_metadata[3])
+        declared = parse_nonnegative_int(parsed_metadata[4])
+        banner_text = parsed_metadata[5] or ""
+        record_key = parsed_metadata[6] or ""
+        summary = summaries[key]
+
+        if (
+            page_number is None
+            or page_number < 1
+            or total_pages is None
+            or total_pages < 1
+            or declared is None
+        ):
+            return f"明細工作表第 {row} 列頁碼或筆數 metadata 無效"
+
+        if (
+            total_pages != summary["total_pages"]
+            or declared != summary["declared_total_records"]
+            or page_number > total_pages
+        ):
+            return (
+                f"明細工作表第 {row} 列 metadata 與主表摘要不一致"
+            )
+
+        expected_banner = (
+            f"{page_number} / {total_pages} 頁，共 {declared} 筆資料"
+        )
+        if expected_banner not in banner_text:
+            return (
+                f"明細工作表第 {row} 列分頁資訊不符合："
+                f"預期包含 {expected_banner!r}"
+            )
+
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", record_key):
+            return (
+                f"明細工作表第 {row} 列資料唯一鍵不是 64 位 SHA-256"
+            )
+
+        if record_key in group_keys[key]:
+            return (
+                f"明細工作表出現重複資料唯一鍵：{section}／{category}；"
+                f"第 {row} 列"
+            )
+
+        group_keys[key].add(record_key)
+        group_counts[key] += 1
+        data_row_count += 1
+
+    if data_row_count != record_count:
+        return (
+            "主表交通違規筆數與明細實際列數不一致："
+            f"主表={record_count}；明細={data_row_count}"
+        )
+
+    for key, summary in summaries.items():
+        expected_count = summary["declared_total_records"]
+        actual_count = group_counts[key]
+        if actual_count != expected_count:
+            return (
+                f"明細分類筆數不一致：{key[0]}／{key[1]}；"
+                f"網站={expected_count}；明細={actual_count}"
+            )
+
+    return None
+
+
+def inspect_existing_result_row(
     workbook: Any,
     worksheet: Any,
+    pagination_audit_sheet: Any,
+    duplicate_audit_sheet: Any,
     company: CompanyRow,
     tracking_columns: dict[str, int],
     resume: bool,
-) -> bool:
+) -> ResumeInspection:
     """
-    只有新版分頁稽核已通過的資料才能續跑略過。
+    判斷既有輸出檔的單一公司是否真的完整。
 
-    舊版雖然顯示「成功」，但沒有逐頁驗證與 showbanner 總筆數，
-    因此一律重新查詢，避免像 45893188 只留下 23 筆。
+    只有以下全部一致才略過：
+    - 主表狀態、訊息、完整性與重複檢查。
+    - 三組主表分頁摘要。
+    - 分頁完整性稽核工作表的逐頁數值。
+    - 重複資料稽核工作表無該公司紀錄。
+    - 明細 A:G 列數、H:N metadata 與唯一鍵。
     """
     if not resume:
-        return False
+        return ResumeInspection(False, "已指定 --no-resume，強制重新查詢")
 
     status = normalize_text(
         worksheet.cell(
@@ -8831,7 +9276,20 @@ def should_skip_row(
     )
 
     if status != STATUS_SUCCESS:
-        return False
+        return ResumeInspection(
+            False,
+            f"既有狀態不是成功：{status or '空白'}",
+        )
+
+    record_count = parse_nonnegative_int(
+        worksheet.cell(
+            company.excel_row,
+            tracking_columns["交通違規筆數"],
+        ).value
+    )
+
+    if record_count is None:
+        return ResumeInspection(False, "交通違規筆數不是有效非負整數")
 
     query_message = normalize_text(
         worksheet.cell(
@@ -8852,88 +9310,140 @@ def should_skip_row(
         ).value
     )
 
-    if (
-        COMBINED_QUERY_MESSAGE_MARKER
-        not in query_message
-        or PAGINATION_VERIFIED_MARKER
-        not in query_message
-        or PAGINATION_VERIFIED_MARKER
-        not in integrity_value
-        or "無重複" not in duplicate_value
-    ):
-        return False
+    if COMBINED_QUERY_MESSAGE_MARKER not in query_message:
+        return ResumeInspection(
+            False,
+            "查詢訊息缺少雙階段完成標記",
+            record_count,
+        )
 
-    for header in (
-        "可線上繳納分頁資訊",
-        "不可線上繳納分頁資訊",
-        "繳納紀錄分頁資訊",
+    if (
+        PAGINATION_VERIFIED_MARKER not in query_message
+        or PAGINATION_VERIFIED_MARKER not in integrity_value
     ):
-        value = normalize_text(
+        return ResumeInspection(
+            False,
+            "主表缺少分頁完整性已驗證標記",
+            record_count,
+        )
+
+    if "無重複" not in duplicate_value:
+        return ResumeInspection(
+            False,
+            "主表重複資料檢查不是無重複",
+            record_count,
+        )
+
+    total_match = re.search(
+        r"合計\s*(\d+)\s*筆",
+        query_message,
+    )
+    if total_match is None or int(total_match.group(1)) != record_count:
+        return ResumeInspection(
+            False,
+            "查詢訊息的合計筆數與主表交通違規筆數不一致",
+            record_count,
+        )
+
+    summaries: dict[tuple[str, str], dict[str, int]] = {}
+
+    for section, category, header in RESUME_EXPECTED_GROUPS:
+        parsed = parse_pagination_summary(
             worksheet.cell(
                 company.excel_row,
                 tracking_columns[header],
             ).value
         )
+
+        if parsed is None:
+            return ResumeInspection(
+                False,
+                f"{header} 格式不完整或無法解析",
+                record_count,
+            )
+
         if (
-            "頁，共" not in value
-            or "已擷取" not in value
-            or "重複 0 筆" not in value
+            parsed["total_pages"] < 1
+            or parsed["declared_total_records"]
+            != parsed["extracted_count"]
+            or parsed["declared_total_records"]
+            != parsed["unique_count"]
+            or parsed["duplicate_count"] != 0
         ):
-            return False
+            return ResumeInspection(
+                False,
+                f"{header} 顯示漏抓、筆數不一致或有重複資料",
+                record_count,
+            )
 
-    record_count_value = worksheet.cell(
-        company.excel_row,
-        tracking_columns["交通違規筆數"],
-    ).value
+        summaries[(section, category)] = parsed
 
-    try:
-        record_count = int(record_count_value)
-    except (TypeError, ValueError):
-        return False
+    declared_total = sum(
+        summary["declared_total_records"]
+        for summary in summaries.values()
+    )
+    if declared_total != record_count:
+        return ResumeInspection(
+            False,
+            "三組網站宣告總筆數與主表交通違規筆數不一致："
+            f"三組合計={declared_total}；主表={record_count}",
+            record_count,
+        )
 
-    if record_count == 0:
-        return True
+    audit_problem = inspect_pagination_audit_rows(
+        pagination_audit_sheet,
+        duplicate_audit_sheet,
+        company,
+        summaries,
+    )
+    if audit_problem is not None:
+        return ResumeInspection(False, audit_problem, record_count)
 
-    expected_title = detail_sheet_name(
-        company.raw_id,
-        company.query_id,
+    detail_problem = inspect_detail_sheet(
+        workbook,
+        company,
+        record_count,
+        summaries,
+    )
+    if detail_problem is not None:
+        return ResumeInspection(False, detail_problem, record_count)
+
+    return ResumeInspection(
+        True,
+        "主表、三組分頁稽核、重複稽核與公司明細均一致",
+        record_count,
     )
 
-    if expected_title not in workbook.sheetnames:
-        return False
 
-    detail_sheet = workbook[expected_title]
-
-    if detail_sheet.max_column < DETAIL_AUDIT_LAST_COLUMN:
-        return False
-
-    nonempty_data_rows = 0
-
-    for row in range(1, detail_sheet.max_row + 1):
-        if any(
-            normalize_text(
-                detail_sheet.cell(row, column).value
-            )
-            for column in range(1, 8)
-        ):
-            nonempty_data_rows += 1
-
-        if not normalize_text(
-            detail_sheet.cell(row, 10).value
-        ).startswith("擷取頁碼："):
+def should_skip_row(
+    workbook: Any,
+    worksheet: Any,
+    company: CompanyRow,
+    tracking_columns: dict[str, int],
+    resume: bool,
+    pagination_audit_sheet: Any | None = None,
+    duplicate_audit_sheet: Any | None = None,
+) -> bool:
+    """保留舊介面；新版內部使用 inspect_existing_result_row()。"""
+    if pagination_audit_sheet is None:
+        if PAGINATION_AUDIT_SHEET_NAME not in workbook.sheetnames:
             return False
+        pagination_audit_sheet = workbook[PAGINATION_AUDIT_SHEET_NAME]
 
-        if not normalize_text(
-            detail_sheet.cell(row, 13).value
-        ).startswith("分頁資訊："):
+    if duplicate_audit_sheet is None:
+        if DUPLICATE_AUDIT_SHEET_NAME not in workbook.sheetnames:
             return False
+        duplicate_audit_sheet = workbook[DUPLICATE_AUDIT_SHEET_NAME]
 
-        if not normalize_text(
-            detail_sheet.cell(row, 14).value
-        ).startswith("資料唯一鍵："):
-            return False
-
-    return nonempty_data_rows == record_count
+    return inspect_existing_result_row(
+        workbook=workbook,
+        worksheet=worksheet,
+        pagination_audit_sheet=pagination_audit_sheet,
+        duplicate_audit_sheet=duplicate_audit_sheet,
+        company=company,
+        tracking_columns=tracking_columns,
+        resume=resume,
+    ).complete
 
 def update_main_row(
     worksheet: Any,
@@ -9243,8 +9753,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "輸出檔存在時續跑；只有已通過新版分頁完整性"
-            "與重複資料檢查的列才會略過"
+            "輸出檔存在時逐筆交叉稽核；只有主表、三組分頁稽核、"
+            "重複稽核、明細 H:N metadata 與唯一鍵全部一致的列才略過"
         ),
     )
     parser.add_argument(
@@ -9564,13 +10074,55 @@ def run_single_input(
         f"同一家公司立即重跑最多 {args.max_browser_restarts} 次。"
     )
 
+    resume_inspections: dict[int, ResumeInspection] = {}
+    repair_companies: list[CompanyRow] = []
+
+    for company in companies:
+        inspection = inspect_existing_result_row(
+            workbook=workbook,
+            worksheet=main_sheet,
+            pagination_audit_sheet=pagination_audit_sheet,
+            duplicate_audit_sheet=duplicate_audit_sheet,
+            company=company,
+            tracking_columns=tracking_columns,
+            resume=args.resume,
+        )
+        resume_inspections[company.excel_row] = inspection
+
+        if not inspection.complete:
+            repair_companies.append(company)
+
+    skipped = len(companies) - len(repair_companies)
+
+    print(
+        "續跑逐筆交叉稽核："
+        f"掃描 {len(companies)} 筆；"
+        f"既有完整 {skipped} 筆；"
+        f"需要重跑 {len(repair_companies)} 筆。"
+    )
+
+    if repair_companies:
+        print("本次只會重跑以下未通過稽核的公司列：")
+        for company in repair_companies:
+            inspection = resume_inspections[company.excel_row]
+            print(
+                f"- Excel 第 {company.excel_row} 列 "
+                f"{company.query_id} {company.name}："
+                f"{inspection.reason}"
+            )
+    else:
+        atomic_save(workbook, output_path)
+        print("既有輸出檔全部資料均通過交叉稽核，不需要啟動瀏覽器。")
+        print(f"輸出檔：{output_path}")
+        print(f"錯誤 JSON：{error_log_dir}")
+        return 0
+
     processed = 0
     success = 0
     zero_result_success = 0
     no_data = 0
     errors = 0
     pending = 0
-    skipped = 0
     deferred = 0
     queue_runs = 0
     integrity_retries = 0
@@ -9578,7 +10130,7 @@ def run_single_input(
 
     work_queue = deque(
         (company, 0)
-        for company in companies
+        for company in repair_companies
     )
 
     with sync_playwright() as playwright:
@@ -9612,21 +10164,6 @@ def run_single_input(
                     )
                     browser_restarts += 1
 
-                if should_skip_row(
-                    workbook,
-                    main_sheet,
-                    company,
-                    tracking_columns,
-                    args.resume,
-                ):
-                    skipped += 1
-                    print(
-                        f"[已完成 {processed}/{len(companies)}] "
-                        f"{company.query_id} {company.name}："
-                        "已通過分頁完整性與重複檢查，略過。"
-                    )
-                    continue
-
                 queue_runs += 1
                 retry_label = (
                     ""
@@ -9639,10 +10176,11 @@ def run_single_input(
                 )
                 print(
                     f"[執行 {queue_runs}；"
-                    f"已完成 {processed}/{len(companies)}；"
+                    f"已完成 {processed}/{len(repair_companies)}；"
                     f"佇列尚有 {len(work_queue)}] "
                     f"查詢 {company.query_id} {company.name}"
-                    f"{retry_label}",
+                    f"{retry_label}；"
+                    f"重跑原因：{resume_inspections[company.excel_row].reason}",
                     flush=True,
                 )
 
@@ -10145,12 +10683,14 @@ def run_single_input(
             safe_close_browser(browser)
 
     print(
-        f"完成。最終處理 {processed} 筆："
-        f"成功 {success}（其中零筆 {zero_result_success}）、"
+        f"完成。掃描 {len(companies)} 筆："
+        f"既有完整略過 {skipped} 筆；"
+        f"需要重跑 {len(repair_companies)} 筆；"
+        f"本次完成 {processed} 筆，其中成功 {success}"
+        f"（零筆 {zero_result_success}）、"
         f"舊版無資料 {no_data}、"
         f"待重試 {pending}、"
         f"錯誤 {errors}；"
-        f"略過 {skipped}、"
         f"曾移至隊尾 {deferred} 次、"
         f"完整性立即重爬 {integrity_retries} 次、"
         f"瀏覽器自動重建 {browser_restarts} 次。"
