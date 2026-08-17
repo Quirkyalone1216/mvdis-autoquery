@@ -121,9 +121,9 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 # mvdisCrawl.py 位於 src 資料夾，因此未指定來源檔時，依序處理：
 # Data\高雄市.xlsx
 # Data\桃園市.xlsx
+# Data\台中市.xlsx
 DEFAULT_INPUT_PATHS = (
-    PROJECT_ROOT / "Data" / "高雄市.xlsx",
-    PROJECT_ROOT / "Data" / "桃園市.xlsx",
+    PROJECT_ROOT / "Data" / "台中市.xlsx",
 )
 
 # 保留第一個預設路徑常數，供舊程式或外部 import 相容使用。

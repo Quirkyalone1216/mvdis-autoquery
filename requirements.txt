@@ -1,0 +1,5 @@
+# Direct runtime dependencies (verified against the project's .venv)
+ddddocr==1.6.1
+openpyxl==3.1.5
+Pillow==12.3.0
+playwright==1.61.0
