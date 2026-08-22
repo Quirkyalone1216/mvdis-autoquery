@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# VERSION: SELECTIVE_RESUME_REPAIR_INCOMPLETE_ROWS_2026-08-06
+# VERSION: CAPTCHA_ERROR_TAIL_RETRY_UNTIL_SUCCESS_2026-08-23
 """
 監理服務網法人交通違規雙階段批次查詢工具。
 
@@ -40,6 +40,12 @@
     --stop-on-integrity-error 才會在該來源檔停止。
 18. results/<來源檔名>_違規明細查詢結果.xlsx 已存在時，預設只把未通過
     交叉驗證的公司列放入查詢佇列；已確認完整的公司不會再次連線查詢。
+19. 兩個查詢頁若明確顯示「驗證碼輸入錯誤」，該公司先保存狀態並移到
+    工作佇列尾端；之後重新輪到時使用新 CAPTCHA 重查。這種「網站明確
+    CAPTCHA 輸入錯誤」不限隊尾次數，直到成功或使用者以 Ctrl+C 中止。
+20. 只有網站明確顯示 CAPTCHA 輸入錯誤才採無限隊尾重試。分頁完整性、
+    統編／表單、網站格式、瀏覽器或其他例外仍依既有有限重試上限處理，
+    達上限後記錄錯誤／待重試並繼續，不會因永久性非 CAPTCHA 錯誤無限循環。
 
 僅可查詢您有權處理的法人／商業資料，並請遵守監理服務網使用規範。
 """
@@ -189,6 +195,24 @@ CURRENT_QUERY_BUTTON_XPATH = (
     "/html/body/table/tbody/tr[2]/td[1]/div[3]/div/"
     "div[2]/form/div/a"
 )
+
+# 兩個查詢頁「網站明確回報驗證碼輸入錯誤」的精確 XPath。
+#
+# 第一階段：https://www.mvdis.gov.tw/m3-emv-vil/vil/penaltyQueryPay
+# <span id="validateStr2" ...>驗證碼輸入錯誤</span>
+CURRENT_CAPTCHA_ERROR_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/div[3]/div/div[2]/"
+    "form/table/tbody/tr[4]/td/span"
+)
+
+# 第二階段：https://www.mvdis.gov.tw/m3-emv-vil/vil/penaltyQueryPayRecord/legal
+# <span id="validateStr2" ...>驗證碼輸入錯誤</span>
+PAID_CAPTCHA_ERROR_XPATH = (
+    "/html/body/table/tbody/tr[2]/td[1]/div[2]/div/div/"
+    "form/table/tbody/tr[4]/td/span"
+)
+
+CAPTCHA_INPUT_ERROR_TEXT = "驗證碼輸入錯誤"
 
 # 第一階段查詢結果容器與目前頁籤所顯示的表格。
 CURRENT_RESULT_CONTAINER_XPATH = (
@@ -399,6 +423,9 @@ class QueryOutcome:
     message: str
     result_url: str
     retry_later: bool = False
+    # 只有網站結果頁明確顯示「驗證碼輸入錯誤」時才設為 True。
+    # main() 會針對此旗標採「不限次數、排到佇列尾端」重試。
+    captcha_input_error: bool = False
     page_audits: list[PageAudit] = field(default_factory=list)
     duplicate_keys: list[str] = field(default_factory=list)
 
@@ -2756,6 +2783,69 @@ def contains_any(
     )
 
 
+def read_captcha_input_error(
+    page: Page,
+    exact_xpath: str,
+) -> str:
+    """
+    只判斷「網站明確顯示驗證碼輸入錯誤」。
+
+    優先讀取呼叫端對應頁面的精確 XPath；若 DOM 小幅調整，
+    再以同頁的 span#validateStr2 備援。只有可見節點文字命中
+    CAPTCHA_ERROR_PATTERNS 才回傳訊息。
+    """
+    candidates = (
+        page.locator(f"xpath={exact_xpath}"),
+        page.locator("span#validateStr2"),
+    )
+
+    for candidate in candidates:
+        try:
+            count = candidate.count()
+        except PlaywrightError:
+            continue
+
+        for index in range(count):
+            item = candidate.nth(index)
+
+            try:
+                if not item.is_visible():
+                    continue
+
+                message = normalize_text(
+                    item.inner_text(timeout=2000)
+                )
+            except PlaywrightError:
+                continue
+
+            if (
+                message
+                and contains_any(
+                    message,
+                    CAPTCHA_ERROR_PATTERNS,
+                )
+            ):
+                return message
+
+    return ""
+
+
+def read_any_captcha_input_error(page: Page) -> str:
+    """依序檢查第一、第二階段的精確 CAPTCHA 錯誤 XPath。"""
+    for xpath in (
+        CURRENT_CAPTCHA_ERROR_XPATH,
+        PAID_CAPTCHA_ERROR_XPATH,
+    ):
+        message = read_captcha_input_error(
+            page,
+            xpath,
+        )
+        if message:
+            return message
+
+    return ""
+
+
 def normalize_record_component(value: Any) -> str:
     if value is None:
         return ""
@@ -4672,6 +4762,7 @@ def write_error_json(
             "record_count": outcome.record_count,
             "message": outcome.message,
             "retry_later": outcome.retry_later,
+            "captcha_input_error": outcome.captcha_input_error,
             "duplicate_keys": outcome.duplicate_keys,
             "page_audits": [
                 asdict(item)
@@ -5047,6 +5138,9 @@ def page_has_result_marker(page: Page) -> bool:
         f"xpath={CURRENT_RESULT_SECOND_TAB_XPATH}",
         f"xpath={CURRENT_PAGINATION_BANNER_XPATH}",
         f"xpath={PAID_PAGINATION_BANNER_XPATH}",
+        f"xpath={CURRENT_CAPTCHA_ERROR_XPATH}",
+        f"xpath={PAID_CAPTCHA_ERROR_XPATH}",
+        "span#validateStr2",
     )
 
     for selector in selectors:
@@ -5099,6 +5193,9 @@ def wait_for_query_result_page(
             page_has_result_marker(page)
             or bool(
                 read_no_paid_data_message(page)
+            )
+            or bool(
+                read_any_captcha_input_error(page)
             )
             or contains_any(
                 latest_text,
@@ -8363,12 +8460,37 @@ def perform_current_violation_query(
                 timeout_ms,
             )
 
+            captcha_error_message = (
+                read_captcha_input_error(
+                    page,
+                    CURRENT_CAPTCHA_ERROR_XPATH,
+                )
+            )
+
+            if captcha_error_message:
+                return QueryOutcome(
+                    status=STATUS_RETRY,
+                    record_count=0,
+                    tables=[],
+                    message=(
+                        "第一階段網站明確回報驗證碼輸入錯誤："
+                        f"{captcha_error_message}；"
+                        "本公司應移到工作佇列尾端，稍後以新 CAPTCHA 重試"
+                    ),
+                    result_url=page.url,
+                    retry_later=True,
+                    captcha_input_error=True,
+                )
+
+            # 若只有 body 文字命中，但精確 XPath / span#validateStr2 未命中，
+            # 只視為一般 CAPTCHA 暫時錯誤，維持有限次數重試，不啟用無限隊尾。
             if contains_any(
                 text,
                 CAPTCHA_ERROR_PATTERNS,
             ):
                 last_retry_message = (
-                    "第一階段網站回報驗證碼輸入錯誤"
+                    "第一階段 body 出現 CAPTCHA 錯誤文字，"
+                    "但未由 validateStr2 節點確認"
                 )
                 continue
 
@@ -8467,7 +8589,7 @@ def perform_current_violation_query(
             last_retry_message
             or (
                 "交通違規（含強制險）查詢連續無法完成 "
-                f"{max_captcha_attempts} 次"
+                f"{max_captcha_attempts} 次（未確認為網站明確驗證碼輸入錯誤）"
             )
         ),
         page.url,
@@ -8526,6 +8648,10 @@ def combine_query_outcomes(
                 or paid_outcome.result_url
             ),
             retry_later=True,
+            captcha_input_error=(
+                current_outcome.captcha_input_error
+                or paid_outcome.captcha_input_error
+            ),
             page_audits=combined_audits,
         )
 
@@ -8681,18 +8807,37 @@ def perform_paid_record_query(
                 timeout_ms,
             )
 
+            captcha_error_message = (
+                read_captcha_input_error(
+                    page,
+                    PAID_CAPTCHA_ERROR_XPATH,
+                )
+            )
+
+            if captcha_error_message:
+                return QueryOutcome(
+                    status=STATUS_RETRY,
+                    record_count=0,
+                    tables=[],
+                    message=(
+                        "第二階段網站明確回報驗證碼輸入錯誤："
+                        f"{captcha_error_message}；"
+                        "本公司應移到工作佇列尾端，稍後以新 CAPTCHA 重試"
+                    ),
+                    result_url=page.url,
+                    retry_later=True,
+                    captcha_input_error=True,
+                )
+
+            # 若只有 body 文字命中，但精確 XPath / span#validateStr2 未命中，
+            # 僅做有限次數的一般 CAPTCHA 重試。
             if contains_any(
                 text,
                 CAPTCHA_ERROR_PATTERNS,
             ):
                 last_retry_message = (
-                    "網站回報驗證碼輸入錯誤"
-                )
-                print(
-                    "  網站回報驗證碼錯誤，"
-                    "將重新取得圖片並再次辨識"
-                    f"（{attempt}/{max_captcha_attempts}）。",
-                    flush=True,
+                    "第二階段 body 出現 CAPTCHA 錯誤文字，"
+                    "但未由 validateStr2 節點確認"
                 )
                 continue
 
@@ -8748,12 +8893,34 @@ def perform_paid_record_query(
 
             text = body_text(page)
 
+            captcha_error_message = (
+                read_captcha_input_error(
+                    page,
+                    PAID_CAPTCHA_ERROR_XPATH,
+                )
+            )
+
+            if captcha_error_message:
+                return QueryOutcome(
+                    status=STATUS_RETRY,
+                    record_count=0,
+                    tables=[],
+                    message=(
+                        "第二階段結果頁由 validateStr2 確認為驗證碼輸入錯誤；"
+                        "本公司應移到工作佇列尾端，稍後以新 CAPTCHA 重試"
+                    ),
+                    result_url=page.url,
+                    retry_later=True,
+                    captcha_input_error=True,
+                )
+
             if contains_any(
                 text,
                 CAPTCHA_ERROR_PATTERNS,
             ):
                 last_retry_message = (
-                    "網站回報驗證碼輸入錯誤"
+                    "第二階段結果頁 body 出現 CAPTCHA 錯誤文字，"
+                    "但未由 validateStr2 節點確認"
                 )
                 continue
 
@@ -8811,7 +8978,7 @@ def perform_paid_record_query(
             last_retry_message
             or (
                 "CAPTCHA／結果頁連續無法完成 "
-                f"{max_captcha_attempts} 次"
+                f"{max_captcha_attempts} 次（未確認為網站明確驗證碼輸入錯誤）"
             )
         ),
         page.url,
@@ -9779,8 +9946,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "耗盡 CAPTCHA 嘗試後，最多移到工作佇列尾端重做幾次；"
-            "預設 1 次"
+            "一般暫時性待重試最多移到工作佇列尾端重做幾次；"
+            "預設 1 次。網站明確顯示『驗證碼輸入錯誤』時不受此上限，"
+            "會持續排到隊尾直到成功或人工中止"
         ),
     )
     parser.add_argument(
@@ -10073,6 +10241,11 @@ def run_single_input(
         "瀏覽器失效策略：自動重建 Page／Context／Browser，"
         f"同一家公司立即重跑最多 {args.max_browser_restarts} 次。"
     )
+    print(
+        "CAPTCHA 輸入錯誤策略：只有兩個網站明確顯示"
+        "『驗證碼輸入錯誤』時才不限次數排到工作佇列尾端重試；"
+        "其他錯誤不採無限重試。"
+    )
 
     resume_inspections: dict[int, ResumeInspection] = {}
     repair_companies: list[CompanyRow] = []
@@ -10170,8 +10343,7 @@ def run_single_input(
                     if requeue_count == 0
                     else (
                         "；隊尾重試 "
-                        f"{requeue_count}/"
-                        f"{args.max_captcha_requeues}"
+                        f"{requeue_count}"
                     )
                 )
                 print(
@@ -10218,6 +10390,15 @@ def run_single_input(
                                 ),
                             )
                         )
+
+                        if current_outcome.captcha_input_error:
+                            outcome = current_outcome
+                            print(
+                                "  第一階段由 validateStr2 確認驗證碼輸入錯誤；"
+                                "不再執行第二階段，直接排到整體佇列尾端。",
+                                flush=True,
+                            )
+                            break
 
                         print(
                             "  [階段 2/2] 法人交通違規繳納記錄查詢",
@@ -10453,32 +10634,24 @@ def run_single_input(
                     )
 
                 if outcome.retry_later:
-                    if (
-                        requeue_count
-                        < args.max_captcha_requeues
-                    ):
-                        next_requeue_count = (
-                            requeue_count + 1
-                        )
+                    # 只有網站明確顯示「驗證碼輸入錯誤」才不限次數。
+                    if outcome.captcha_input_error:
+                        next_requeue_count = requeue_count + 1
                         deferred_outcome = QueryOutcome(
                             status=STATUS_RETRY,
                             record_count=0,
                             tables=[],
                             message=(
                                 f"{outcome.message}；"
-                                "已移到工作佇列尾端，其他資料完成後"
-                                "將自動重做"
-                                f"（隊尾重試 {next_requeue_count}/"
-                                f"{args.max_captcha_requeues}）"
+                                "已保存並移到工作佇列尾端；"
+                                f"稍後自動進行第 {next_requeue_count} 次隊尾重試；"
+                                "此類網站明確 CAPTCHA 輸入錯誤不限重試次數"
                             ),
                             result_url=outcome.result_url,
                             retry_later=True,
-                            page_audits=(
-                                outcome.page_audits
-                            ),
-                            duplicate_keys=(
-                                outcome.duplicate_keys
-                            ),
+                            captcha_input_error=True,
+                            page_audits=outcome.page_audits,
+                            duplicate_keys=outcome.duplicate_keys,
                         )
                         remove_existing_detail_variants(
                             workbook,
@@ -10511,10 +10684,19 @@ def run_single_input(
                         error_path = write_error_json(
                             error_log_dir,
                             company,
-                            phase="待重試_已移到隊尾",
+                            phase="驗證碼輸入錯誤_不限次數_已移到隊尾",
                             message=deferred_outcome.message,
-                            page=(page if page_is_open(page) else None),
+                            page=(
+                                page
+                                if page_is_open(page)
+                                else None
+                            ),
                             outcome=deferred_outcome,
+                            details={
+                                "tail_retry_count": next_requeue_count,
+                                "captcha_input_error": True,
+                                "unlimited_tail_retry": True,
+                            },
                         )
                         atomic_save(
                             workbook,
@@ -10522,7 +10704,93 @@ def run_single_input(
                         )
                         deferred += 1
                         print(
-                            "  → 待重試；"
+                            "  → 網站明確驗證碼輸入錯誤；"
+                            f"{company.query_id} 已排到佇列尾端；"
+                            f"隊尾重試次數={next_requeue_count}（不限上限）；"
+                            f"JSON：{error_path}",
+                            flush=True,
+                        )
+
+                        if work_queue:
+                            time.sleep(
+                                random.uniform(
+                                    args.delay_min,
+                                    args.delay_max,
+                                )
+                            )
+                        continue
+
+                    # 其他暫時性錯誤仍維持有限次數隊尾重試。
+                    if requeue_count < args.max_captcha_requeues:
+                        next_requeue_count = requeue_count + 1
+                        deferred_outcome = QueryOutcome(
+                            status=STATUS_RETRY,
+                            record_count=0,
+                            tables=[],
+                            message=(
+                                f"{outcome.message}；"
+                                "已移到工作佇列尾端，其他資料完成後將自動重做"
+                                f"（一般暫時性隊尾重試 {next_requeue_count}/"
+                                f"{args.max_captcha_requeues}）"
+                            ),
+                            result_url=outcome.result_url,
+                            retry_later=True,
+                            captcha_input_error=False,
+                            page_audits=outcome.page_audits,
+                            duplicate_keys=outcome.duplicate_keys,
+                        )
+                        remove_existing_detail_variants(
+                            workbook,
+                            company.raw_id,
+                            company.query_id,
+                        )
+                        update_main_row(
+                            main_sheet,
+                            company,
+                            deferred_outcome,
+                            queried_at,
+                            tracking_columns,
+                        )
+                        append_log(
+                            log_sheet,
+                            company,
+                            deferred_outcome,
+                            queried_at,
+                        )
+                        replace_company_audit_rows(
+                            pagination_audit_sheet,
+                            duplicate_audit_sheet,
+                            company,
+                            deferred_outcome,
+                            queried_at,
+                        )
+                        work_queue.append(
+                            (company, next_requeue_count)
+                        )
+                        error_path = write_error_json(
+                            error_log_dir,
+                            company,
+                            phase="一般暫時性錯誤_已移到隊尾",
+                            message=deferred_outcome.message,
+                            page=(
+                                page
+                                if page_is_open(page)
+                                else None
+                            ),
+                            outcome=deferred_outcome,
+                            details={
+                                "tail_retry_count": next_requeue_count,
+                                "captcha_input_error": False,
+                                "unlimited_tail_retry": False,
+                            },
+                        )
+                        atomic_save(
+                            workbook,
+                            output_path,
+                        )
+                        deferred += 1
+                        print(
+                            "  → 一般暫時性待重試；"
                             f"{company.query_id} 已排到佇列尾端；"
                             f"JSON：{error_path}",
                             flush=True,
@@ -10543,12 +10811,14 @@ def run_single_input(
                         tables=[],
                         message=(
                             f"{outcome.message}；"
-                            "已達本次執行允許的隊尾重試上限 "
+                            "這不是網站明確的『驗證碼輸入錯誤』，"
+                            "且已達一般暫時性隊尾重試上限 "
                             f"{args.max_captcha_requeues} 次；"
-                            "保留為待重試，下次使用 --resume 執行時"
-                            "會自動重做"
+                            "本次不再無限重試，保留為待重試／錯誤紀錄"
                         ),
                         result_url=outcome.result_url,
+                        retry_later=False,
+                        captcha_input_error=False,
                         page_audits=outcome.page_audits,
                         duplicate_keys=outcome.duplicate_keys,
                     )
@@ -10691,7 +10961,7 @@ def run_single_input(
         f"舊版無資料 {no_data}、"
         f"待重試 {pending}、"
         f"錯誤 {errors}；"
-        f"曾移至隊尾 {deferred} 次、"
+        f"曾移至隊尾 {deferred} 次（網站明確 CAPTCHA 錯誤可不限次數）、"
         f"完整性立即重爬 {integrity_retries} 次、"
         f"瀏覽器自動重建 {browser_restarts} 次。"
     )
